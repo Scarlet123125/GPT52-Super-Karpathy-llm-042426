@@ -1,1566 +1,1914 @@
 import os
+import re
+import io
+import json
+import time
+import zipfile
+import hashlib
+import textwrap
+from dataclasses import dataclass
 from datetime import datetime
-from io import BytesIO
+from typing import Dict, List, Optional, Tuple, Generator
 
 import streamlit as st
 import yaml
 import pandas as pd
 import altair as alt
-from pypdf import PdfReader
-#from docx import Document  # for .docx support
+
 try:
-    from docx import Document  # provided by python-docx
-except ImportError:
-    Document = None
-# External LLM clients
-from openai import OpenAI
-import google.generativeai as genai
-from anthropic import Anthropic
-import httpx
+    import fitz  # PyMuPDF
+except Exception:
+    fitz = None
 
 
-# =========================
-# Constants & configuration
-# =========================
+# ----------------------------
+# Constants / Config
+# ----------------------------
 
-ALL_MODELS = [
+APP_TITLE = "Knowledge Agent WOW v4.1"
+DEFAULT_OUTPUT_LANGUAGE = "Traditional Chinese"
+OUTPUT_LANGUAGES = ["Traditional Chinese", "English"]
+
+DEFAULT_MODEL = "gemini-3-flash-preview"
+
+MODEL_OPTIONS = [
+    "gemini-3-flash-preview",
+    "gemini-3.1-flash-lite-preview",
     "gpt-4o-mini",
     "gpt-4.1-mini",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-3-flash-preview",
-    "claude-3-5-sonnet-2024-10",
-    "claude-3-5-haiku-20241022",
     "grok-4-fast-reasoning",
     "grok-3-mini",
+    # Anthropic models are variable; allow custom entry in UI too.
+    "claude-3-5-sonnet-latest",
+    "claude-3-5-haiku-latest",
 ]
-
-OPENAI_MODELS = {"gpt-4o-mini", "gpt-4.1-mini"}
-GEMINI_MODELS = {"gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3-flash-preview"}
-ANTHROPIC_MODELS = {"claude-3-5-sonnet-20210", "claude-3-5-sonnet-2024-10", "claude-3-5-haiku-20241022"}
-GROK_MODELS = {"grok-4-fast-reasoning", "grok-3-mini"}
 
 PAINTER_STYLES = [
-    "Van Gogh", "Monet", "Picasso", "Da Vinci", "Rembrandt",
-    "Matisse", "Kandinsky", "Hokusai", "Yayoi Kusama", "Frida Kahlo",
-    "Salvador Dali", "Rothko", "Pollock", "Chagall", "Basquiat",
-    "Haring", "Georgia O'Keeffe", "Turner", "Seurat", "Escher"
+    "Vincent van Gogh",
+    "Claude Monet",
+    "Pablo Picasso",
+    "Salvador Dalí",
+    "Rembrandt",
+    "Johannes Vermeer",
+    "Katsushika Hokusai",
+    "Utagawa Hiroshige",
+    "Jackson Pollock",
+    "Gustav Klimt",
+    "Frida Kahlo",
+    "Edward Hopper",
+    "Henri Matisse",
+    "René Magritte",
+    "Andy Warhol",
+    "Georgia O’Keeffe",
+    "Paul Cézanne",
+    "Caravaggio",
+    "J.M.W. Turner",
+    "Wassily Kandinsky",
 ]
 
-# Localized labels for tabs
-LABELS = {
-    "Dashboard": {"English": "Dashboard", "繁體中文": "儀表板"},
-    "510k_tab": {"English": "510(k) Intelligence", "繁體中文": "510(k) 智能分析"},
-    "PDF → Markdown": {"English": "PDF → Markdown", "繁體中文": "PDF → Markdown"},
-    "Summary & Entities": {"English": "Summary & Entities", "繁體中文": "綜合摘要與實體"},
-    "Comparator": {"English": "Comparator", "繁體中文": "文件版本比較"},
-    "Checklist & Report": {"English": "Checklist & Report", "繁體中文": "審查清單與報告"},
-    "Note Keeper & Magics": {"English": "Note Keeper & Magics", "繁體中文": "筆記助手與魔法"},
-    "FDA Orchestration": {"English": "FDA Reviewer Orchestration", "繁體中文": "FDA 審查協同規劃"},
-    "Dynamic Agents": {"English": "Dynamic Agents from Guidance", "繁體中文": "依據指引動態產生代理"},
+WOW_SUMMARY_MAGICS = [
+    "Truth-Table & Claims Audit",
+    "Cross-Document Contradiction Finder",
+    "Obsidian Linksmith (Graph Booster)",
+    "Executive Reframe (Audience Switch)",
+    "Study Kit Generator",
+    "Action Plan & Checklist",
+]
+
+NOTE_MAGICS = [
+    "AI Formatting",
+    "AI Keywords Highlighter",
+    "AI Outline-to-Note",
+    "AI Dedup & Merge",
+    "AI Citation Helper",
+    "AI Obsidian Linking",
+]
+
+VISUALIZATION_OPTIONS = [
+    "Run Timeline (Gantt-like)",
+    "Source Contribution Heatmap (Heuristic)",
+    "Topic Map (Top Terms)",
+    "Entity Network (Heuristic Co-occurrence)",
+    "Risk & Uncertainty Radar (Heuristic)",
+    "Version Diff Viewer (Text)",
+]
+
+ENV_KEY_NAMES = {
+    "gemini": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+    "openai": ["OPENAI_API_KEY"],
+    "anthropic": ["ANTHROPIC_API_KEY"],
+    "grok": ["XAI_API_KEY", "GROK_API_KEY"],
 }
 
-# Painter style CSS snippets (simple examples)
-STYLE_CSS = {
-    "Van Gogh": """
-      body { background: radial-gradient(circle at top left, #243B55, #141E30); }
-    """,
-    "Monet": """
-      body { background: linear-gradient(120deg, #a1c4fd, #c2e9fb); }
-    """,
-    "Picasso": """
-      body { background: linear-gradient(135deg, #ff9a9e, #fecfef); }
-    """,
-    "Da Vinci": """
-      body { background: radial-gradient(circle, #f9f1c6, #c9a66b); }
-    """,
-    "Rembrandt": """
-      body { background: radial-gradient(circle, #2c1810, #0b090a); }
-    """,
-    "Matisse": """
-      body { background: linear-gradient(135deg, #ffecd2, #fcb69f); }
-    """,
-    "Kandinsky": """
-      body { background: linear-gradient(135deg, #00c6ff, #0072ff); }
-    """,
-    "Hokusai": """
-      body { background: linear-gradient(135deg, #2b5876, #4e4376); }
-    """,
-    "Yayoi Kusama": """
-      body { background: radial-gradient(circle, #ffdd00, #ff6a00); }
-    """,
-    "Frida Kahlo": """
-      body { background: linear-gradient(135deg, #f8b195, #f67280, #c06c84); }
-    """,
-    "Salvador Dali": """
-      body { background: linear-gradient(135deg, #1a2a6c, #b21f1f, #fdbb2d); }
-    """,
-    "Rothko": """
-      body { background: linear-gradient(135deg, #141E30, #243B55); }
-    """,
-    "Pollock": """
-      body { background: repeating-linear-gradient(
-        45deg,
-        #222,
-        #222 10px,
-        #333 10px,
-        #333 20px
-      ); }
-    """,
-    "Chagall": """
-      body { background: linear-gradient(135deg, #a18cd1, #fbc2eb); }
-    """,
-    "Basquiat": """
-      body { background: linear-gradient(135deg, #f7971e, #ffd200); }
-    """,
-    "Haring": """
-      body { background: linear-gradient(135deg, #ff512f, #dd2476); }
-    """,
-    "Georgia O'Keeffe": """
-      body { background: linear-gradient(135deg, #ffefba, #ffffff); }
-    """,
-    "Turner": """
-      body { background: linear-gradient(135deg, #f8ffae, #43c6ac); }
-    """,
-    "Seurat": """
-      body { background: radial-gradient(circle, #e0eafc, #cfdef3); }
-    """,
-    "Escher": """
-      body { background: linear-gradient(135deg, #232526, #414345); }
-    """,
-}
-
-# =========================
-# FDA Orchestrator Prompts
-# =========================
-
-FDA_ORCH_SYSTEM_PROMPT = """
-You are an expert FDA review orchestrator with comprehensive knowledge of medical 
-device regulatory review processes. Your role is to analyze device information 
-and intelligently recommend which specialized review agents should be used, in 
-what sequence, and with what priority.
-
-Use the agent catalog (agents.yaml content) provided to you as the universe of available
-agents. Map device characteristics to these agents, following this framework:
-
-[THE FULL SPEC FROM USER – STEPS 1–4, TABLE FORMATS, AGENT CATEGORIES, 
-MANDATORY CORE AGENTS, CONDITIONAL AGENTS, DEVICE-SPECIFIC SPECIALISTS,
-PHASES 1–4, OUTPUT FORMAT, TIMELINE, FOCUS AREAS, CHALLENGES, AGENT COMMANDS, etc.]
-
-Be thorough, specific, and provide clear rationale for each agent recommendation.
-Tailor your response to the specific device characteristics provided.
-If information is incomplete, note what additional details would refine the recommendation.
-"""
-
-FDA_ORCH_USER_TEMPLATE = """
-Please analyze the following medical device information and provide a comprehensive 
-review orchestration plan with recommended specialized agents:
-
-**DEVICE INFORMATION:**
-
-```
-{device_information}
-```
-
-**ADDITIONAL CONTEXT** (if provided):
-- Submission Type: {submission_type}
-- Regulatory Pathway: {regulatory_pathway}
-- Known Predicates: {known_predicates}
-- Clinical Data Available: {clinical_data_status}
-- Special Circumstances: {special_circumstances}
-
-**REQUESTED ANALYSIS DEPTH:**
-- {depth_quick}
-- {depth_standard}
-- {depth_comprehensive}
-
-Based on this information, please provide:
-
-1. **Device Classification Analysis** - Determine device type, CFR part, risk class
-2. **Comprehensive Agent Recommendation** - All applicable agents organized by phase
-3. **Execution Sequence** - Optimal order and parallelization opportunities
-4. **Timeline Estimate** - Realistic review timeline
-5. **Critical Focus Areas** - What reviewers must pay special attention to
-6. **Anticipated Challenges** - Potential regulatory hurdles
-7. **Execution Commands** - Ready-to-use commands for running agents
-
-If any device information is unclear or incomplete, please note what additional 
-details would help refine your recommendations.
-
-Use only agents that exist in the provided agents.yaml catalog. 
-Return the orchestration plan in well-structured markdown with all required tables.
-"""
-
-# =========================
-# Dynamic Agent Generator Prompt
-# =========================
-
-DYNAMIC_AGENT_SYSTEM_PROMPT = """
-You are a regulatory agent designer. Your job is to look at FDA guidance content
-(and optionally an existing review checklist) and generate NEW specialized review
-agents in YAML format that can be added to agents.yaml.
-
-Requirements:
-
-1. Output valid YAML defining between 3 and 8 agents under a top-level key `agents`.
-2. Each agent must include at least:
-   - agent_id: string (e.g., "AGENT-200")
-   - name: descriptive name
-   - version: "1.0"
-   - category: a high-level category such as "Core Review", "Specialized Analysis",
-     "Device-Specific Expert", or "Workflow Utility"
-   - description: 1–2 sentence description of what the agent does
-   - model: pick a realistic default (e.g., "gpt-4o-mini" or "gemini-2.5-flash")
-   - temperature: float (0.1–0.4 for deterministic regulatory work)
-   - max_tokens: integer (e.g., 16000–22000)
-   - system_prompt: detailed instructions for the agent, grounded in the guidance
-   - user_prompt_template: with placeholders for user inputs
-   - output_requirements: structured object describing min tables/sections/etc.
-   - validation_rules: simple checks (e.g., require_sections, check_table_count)
-
-3. Agents must be clearly tied to sections of the FDA guidance. For example:
-   - A "Performance Testing Matrix Builder" agent that converts guidance testing
-     requirements into a matrix.
-   - A "Benefit-Risk Focused Reviewer" agent for guidance sections on benefit-risk.
-   - A "Human Factors & Usability Reviewer" agent for HF-focused guidance.
-
-4. Do NOT repeat agents that already exist in the provided agents.yaml catalog.
-   Create complementary, non-duplicative capabilities.
-
-5. Use descriptions and prompt templates similar in richness and style to the
-   existing default agents (e.g., intelligence_analyst, guidance_to_checklist_converter).
-
-Return ONLY YAML. Do not wrap it in markdown backticks.
-"""
-
-# =========================
-# Helper functions
-# =========================
-
-def t(key: str) -> str:
-    """Translate label key based on current language."""
-    lang = st.session_state.settings.get("language", "English")
-    return LABELS.get(key, {}).get(lang, key)
+# Workspace base (HF Spaces typically allows /tmp)
+WORKSPACE_BASE = os.environ.get("KA_WORKSPACE", "/tmp/knowledge_agent_wow")
 
 
-def apply_style(theme: str, painter_style: str):
-    """Apply painter-based WOW CSS and theme adjustments."""
-    css = STYLE_CSS.get(painter_style, "")
-    if theme == "Dark":
-        css += """
-          body { color: #e0e0e0; }
-          .stButton>button { background-color: #1f2933; color: white; border-radius: 999px; }
-          .stTextInput>div>div>input, .stTextArea textarea {
-            background-color: #111827; color: #e5e7eb; border-radius: 0.5rem;
-          }
-        """
-    else:
-        css += """
-          body { color: #111827; }
-          .stButton>button { background-color: #2563eb; color: white; border-radius: 999px; }
-          .stTextInput>div>div>input, .stTextArea textarea {
-            background-color: #ffffff; color: #111827; border-radius: 0.5rem;
-          }
-        """
-    st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
+# ----------------------------
+# Utility: Session State Init
+# ----------------------------
+
+def _init_state():
+    ss = st.session_state
+    ss.setdefault("run_id", None)
+    ss.setdefault("run_meta", {})
+    ss.setdefault("logs", [])
+    ss.setdefault("stage", "Idle")
+    ss.setdefault("queue", [])  # list[dict] with file entries
+    ss.setdefault("converted", {})  # file_id -> markdown text
+    ss.setdefault("converted_paths", {})  # file_id -> path
+    ss.setdefault("summary_versions", [])  # list of dict: {id, name, text, created_at, meta}
+    ss.setdefault("active_summary_id", None)
+    ss.setdefault("magic_outputs", [])  # list of dict outputs
+    ss.setdefault("note_versions", [])
+    ss.setdefault("agents_yaml_text", "")
+    ss.setdefault("agents_yaml_standard_report", "")
+    ss.setdefault("keys_user", {})  # provider -> key if user entered
+    ss.setdefault("model_global", DEFAULT_MODEL)
+    ss.setdefault("model_by_feature", {
+        "summary": DEFAULT_MODEL,
+        "summary_chat": DEFAULT_MODEL,
+        "summary_magic": DEFAULT_MODEL,
+        "note_keeper": DEFAULT_MODEL,
+        "agents_standardize": DEFAULT_MODEL,
+    })
+    ss.setdefault("prompt_templates", default_prompt_templates())
+    ss.setdefault("output_language", DEFAULT_OUTPUT_LANGUAGE)
+    ss.setdefault("ui_language", "Traditional Chinese")
+    ss.setdefault("theme", "Light")
+    ss.setdefault("painter_style", "None")
+    ss.setdefault("last_run_artifacts_dir", None)
+    ss.setdefault("timeline_events", [])  # list of dict: {t, stage, doc_id?, msg}
+    ss.setdefault("doc_metrics", {})  # doc_id -> metrics dict
+    ss.setdefault("stop_flag", False)
 
 
-def get_provider(model: str) -> str:
-    if model in OPENAI_MODELS:
-        return "openai"
-    if model in GEMINI_MODELS:
-        return "gemini"
-    if model in ANTHROPIC_MODELS:
-        return "anthropic"
-    if model in GROK_MODELS:
-        return "grok"
-    raise ValueError(f"Unknown model: {model}")
+# ----------------------------
+# Logging & Telemetry
+# ----------------------------
+
+def now_iso():
+    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def call_llm(model: str, system_prompt: str, user_prompt: str,
-             max_tokens: int = 12000, temperature: float = 0.2,
-             api_keys: dict | None = None) -> str:
-    """Synchronous LLM call with routing across OpenAI, Gemini, Anthropic, Grok."""
-    provider = get_provider(model)
-    api_keys = api_keys or {}
-
-    def get_key(name: str, env_var: str) -> str:
-        return api_keys.get(name) or os.getenv(env_var) or ""
-
-    if provider == "openai":
-        key = get_key("openai", "OPENAI_API_KEY")
-        if not key:
-            raise RuntimeError("Missing OpenAI API key.")
-        client = OpenAI(api_key=key)
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-        return resp.choices[0].message.content
-
-    if provider == "gemini":
-        key = get_key("gemini", "GEMINI_API_KEY")
-        if not key:
-            raise RuntimeError("Missing Gemini API key.")
-        genai.configure(api_key=key)
-        llm = genai.GenerativeModel(model)
-        resp = llm.generate_content(
-            system_prompt + "\n\n" + user_prompt,
-            generation_config={"max_output_tokens": max_tokens, "temperature": temperature},
-        )
-        return resp.text
-
-    if provider == "anthropic":
-        key = get_key("anthropic", "ANTHROPIC_API_KEY")
-        if not key:
-            raise RuntimeError("Missing Anthropic API key.")
-        client = Anthropic(api_key=key)
-        resp = client.messages.create(
-            model=model,
-            system=system_prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            messages=[{"role": "user", "content": user_prompt}],
-        )
-        return resp.content[0].text
-
-    if provider == "grok":
-        key = get_key("grok", "GROK_API_KEY")
-        if not key:
-            raise RuntimeError("Missing Grok (xAI) API key.")
-        with httpx.Client(base_url="https://api.x.ai/v1", timeout=60) as client:
-            resp = client.post(
-                "/chat/completions",
-                headers={"Authorization": f"Bearer {key}"},
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "max_tokens": max_tokens,
-                    "temperature": temperature,
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        return data["choices"][0]["message"]["content"]
-
-
-def show_status(step_name: str, status: str):
-    """Small colored indicator."""
-    color = {
-        "pending": "gray",
-        "running": "#f59e0b",
-        "done": "#10b981",
-        "error": "#ef4444",
-    }.get(status, "gray")
-    st.markdown(
-        f"""
-        <div style="display:flex;align-items:center;margin-bottom:0.25rem;">
-          <div style="width:10px;height:10px;border-radius:50%;background:{color};margin-right:6px;"></div>
-          <span style="font-size:0.9rem;">{step_name} – <b>{status}</b></span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def log_event(tab: str, agent: str, model: str, tokens_est: int):
-    st.session_state["history"].append({
-        "tab": tab,
-        "agent": agent,
-        "model": model,
-        "tokens_est": tokens_est,
-        "ts": datetime.utcnow().isoformat()
+def log(msg: str, level: str = "INFO", doc_id: Optional[str] = None, stage: Optional[str] = None):
+    entry = {
+        "time": now_iso(),
+        "level": level,
+        "stage": stage or st.session_state.get("stage", "Unknown"),
+        "doc_id": doc_id,
+        "msg": msg,
+    }
+    st.session_state.logs.append(entry)
+    st.session_state.timeline_events.append({
+        "time": time.time(),
+        "stage": entry["stage"],
+        "doc_id": doc_id or "",
+        "level": level,
+        "msg": msg,
     })
 
 
-def extract_pdf_pages_to_text(file, start_page: int, end_page: int) -> str:
-    """Extract text from a PDF between start_page and end_page (1-based, inclusive)."""
-    reader = PdfReader(file)
-    n = len(reader.pages)
-    start = max(0, start_page - 1)
-    end = min(n, end_page)
-    texts = []
-    for i in range(start, end):
-        try:
-            texts.append(reader.pages[i].extract_text() or "")
-        except Exception:
-            texts.append("")
-    return "\n\n".join(texts)
-
-
-def extract_docx_to_text(file) -> str:
-    """Extract text from a DOCX file (if python-docx is installed)."""
-    if Document is None:
-        # Graceful fallback if python-docx is not installed
-        return ""
-    try:
-        from io import BytesIO
-        bio = BytesIO(file.read())
-        doc = Document(bio)
-        return "\n".join(p.text for p in doc.paragraphs)
-    except Exception:
-        return ""
-
-
-def agent_run_ui(
-    agent_id: str,
-    tab_key: str,
-    default_prompt: str,
-    default_input_text: str = "",
-    allow_model_override: bool = True,
-    tab_label_for_history: str | None = None,
-):
-    """Reusable UI for running any agent defined in agents.yaml."""
-    agents_cfg = st.session_state["agents_cfg"]
-    agent_cfg = agents_cfg["agents"][agent_id]
-    status_key = f"{tab_key}_status"
-    if status_key not in st.session_state:
-        st.session_state[status_key] = "pending"
-
-    show_status(agent_cfg.get("name", agent_id), st.session_state[status_key])
-
-    col1, col2, col3 = st.columns([2, 1, 1])
-    with col1:
-        user_prompt = st.text_area(
-            "Prompt",
-            value=st.session_state.get(f"{tab_key}_prompt", default_prompt),
-            height=160,
-            key=f"{tab_key}_prompt",
-        )
-    with col2:
-        base_model = agent_cfg.get("model", st.session_state.settings["model"])
-        model_index = ALL_MODELS.index(base_model) if base_model in ALL_MODELS else 0
-        model = st.selectbox(
-            "Model",
-            ALL_MODELS,
-            index=model_index,
-            disabled=not allow_model_override,
-            key=f"{tab_key}_model",
-        )
-    with col3:
-        max_tokens = st.number_input(
-            "max_tokens",
-            min_value=1000,
-            max_value=120000,
-            value=st.session_state.settings["max_tokens"],
-            step=1000,
-            key=f"{tab_key}_max_tokens",
-        )
-
-    input_text = st.text_area(
-        "Input Text / Markdown",
-        value=st.session_state.get(f"{tab_key}_input", default_input_text),
-        height=260,
-        key=f"{tab_key}_input",
-    )
-
-    run = st.button("Run Agent", key=f"{tab_key}_run")
-
-    if run:
-        st.session_state[status_key] = "running"
-        show_status(agent_cfg.get("name", agent_id), "running")
-        api_keys = st.session_state.get("api_keys", {})
-        system_prompt = agent_cfg.get("system_prompt", "")
-        user_full = f"{user_prompt}\n\n---\n\n{input_text}"
-
-        with st.spinner("Running agent..."):
-            try:
-                out = call_llm(
-                    model=model,
-                    system_prompt=system_prompt,
-                    user_prompt=user_full,
-                    max_tokens=max_tokens,
-                    temperature=st.session_state.settings["temperature"],
-                    api_keys=api_keys,
-                )
-                st.session_state[f"{tab_key}_output"] = out
-                st.session_state[status_key] = "done"
-                token_est = int(len(user_full + out) / 4)
-                log_event(
-                    tab_label_for_history or tab_key,
-                    agent_cfg.get("name", agent_id),
-                    model,
-                    token_est,
-                )
-            except Exception as e:
-                st.session_state[status_key] = "error"
-                st.error(f"Agent error: {e}")
-
-    # Editable output
-    output = st.session_state.get(f"{tab_key}_output", "")
-    view_mode = st.radio(
-        "View mode", ["Markdown", "Plain text"],
-        horizontal=True, key=f"{tab_key}_viewmode"
-    )
-    if view_mode == "Markdown":
-        edited = st.text_area(
-            "Output (Markdown, editable)",
-            value=output,
-            height=320,
-            key=f"{tab_key}_output_md",
-        )
-    else:
-        edited = st.text_area(
-            "Output (Plain text, editable)",
-            value=output,
-            height=320,
-            key=f"{tab_key}_output_txt",
-        )
-
-    st.session_state[f"{tab_key}_output_edited"] = edited
-
-
-# =========================
-# Sidebar (WOW UI + API)
-# =========================
-
-def render_sidebar():
-    with st.sidebar:
-        st.markdown("### Global Settings")
-
-        # Theme
-        st.session_state.settings["theme"] = st.radio(
-            "Theme", ["Light", "Dark"],
-            index=0 if st.session_state.settings["theme"] == "Light" else 1,
-        )
-
-        # Language
-        st.session_state.settings["language"] = st.radio(
-            "Language", ["English", "繁體中文"],
-            index=0 if st.session_state.settings["language"] == "English" else 1,
-        )
-
-        # Painter style + Jackpot
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            style = st.selectbox(
-                "Painter Style",
-                PAINTER_STYLES,
-                index=PAINTER_STYLES.index(st.session_state.settings["painter_style"]),
-            )
-        with col2:
-            if st.button("Jackpot!"):
-                import random
-                style = random.choice(PAINTER_STYLES)
-        st.session_state.settings["painter_style"] = style
-
-        # Default model, tokens, temperature
-        st.session_state.settings["model"] = st.selectbox(
-            "Default Model",
-            ALL_MODELS,
-            index=ALL_MODELS.index(st.session_state.settings["model"]),
-        )
-        st.session_state.settings["max_tokens"] = st.number_input(
-            "Default max_tokens",
-            min_value=1000,
-            max_value=120000,
-            value=st.session_state.settings["max_tokens"],
-            step=1000,
-        )
-        st.session_state.settings["temperature"] = st.slider(
-            "Temperature",
-            0.0,
-            1.0,
-            st.session_state.settings["temperature"],
-            0.05,
-        )
-
-        # API Keys (hidden if from env)
-        st.markdown("---")
-        st.markdown("### API Keys")
-
-        keys = {}
-
-        if os.getenv("OPENAI_API_KEY"):
-            keys["openai"] = os.getenv("OPENAI_API_KEY")
-            st.caption("OpenAI key from environment.")
-        else:
-            keys["openai"] = st.text_input("OpenAI API Key", type="password")
-
-        if os.getenv("GEMINI_API_KEY"):
-            keys["gemini"] = os.getenv("GEMINI_API_KEY")
-            st.caption("Gemini key from environment.")
-        else:
-            keys["gemini"] = st.text_input("Gemini API Key", type="password")
-
-        if os.getenv("ANTHROPIC_API_KEY"):
-            keys["anthropic"] = os.getenv("ANTHROPIC_API_KEY")
-            st.caption("Anthropic key from environment.")
-        else:
-            keys["anthropic"] = st.text_input("Anthropic API Key", type="password")
-
-        if os.getenv("GROK_API_KEY"):
-            keys["grok"] = os.getenv("GROK_API_KEY")
-            st.caption("Grok key from environment.")
-        else:
-            keys["grok"] = st.text_input("Grok API Key", type="password")
-
-        st.session_state["api_keys"] = keys
-
-        # Optional override of agents.yaml
-        st.markdown("---")
-        st.markdown("### Agents Catalog (agents.yaml)")
-        uploaded_agents = st.file_uploader("Upload custom agents.yaml", type=["yaml", "yml"])
-        if uploaded_agents is not None:
-            try:
-                cfg = yaml.safe_load(uploaded_agents.read())
-                if "agents" in cfg:
-                    st.session_state["agents_cfg"] = cfg
-                    st.success("Custom agents.yaml loaded for this session.")
-                else:
-                    st.warning("Uploaded YAML has no top-level 'agents' key. Using default config.")
-            except Exception as e:
-                st.error(f"Failed to parse uploaded YAML: {e}")
-
-
-# =========================
-# Tab renderers
-# =========================
-
-def render_dashboard():
-    st.title(t("Dashboard"))
-    hist = st.session_state["history"]
-    if not hist:
-        st.info("No runs yet.")
-        return
-
-    df = pd.DataFrame(hist)
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Total Runs", len(df))
-    with col2:
-        st.metric("Unique 510(k) Sessions", df[df["tab"].str.contains("510", na=False)].shape[0])
-    with col3:
-        st.metric("Approx Tokens Processed", int(df["tokens_est"].sum()))
-
-    st.subheader("Runs by Tab")
-    chart_tab = alt.Chart(df).mark_bar().encode(
-        x="tab:N",
-        y="count():Q",
-        color="tab:N",
-        tooltip=["tab", "count()"],
-    )
-    st.altair_chart(chart_tab, use_container_width=True)
-
-    st.subheader("Runs by Model")
-    chart_model = alt.Chart(df).mark_bar().encode(
-        x="model:N",
-        y="count():Q",
-        color="model:N",
-        tooltip=["model", "count()"],
-    )
-    st.altair_chart(chart_model, use_container_width=True)
-
-    st.subheader("Token Usage Over Time")
-    df_time = df.copy()
-    df_time["ts"] = pd.to_datetime(df_time["ts"])
-    chart_time = alt.Chart(df_time).mark_line(point=True).encode(
-        x="ts:T",
-        y="tokens_est:Q",
-        color="tab:N",
-        tooltip=["ts", "tab", "agent", "model", "tokens_est"],
-    )
-    st.altair_chart(chart_time, use_container_width=True)
-
-    st.subheader("Recent Activity")
-    st.dataframe(df.sort_values("ts", ascending=False).head(25), use_container_width=True)
-
-
-def render_510k_tab():
-    st.title(t("510k_tab"))
-
-    col1, col2 = st.columns(2)
-    with col1:
-        device_name = st.text_input("Device Name")
-        k_number = st.text_input("510(k) Number (e.g., K123456)")
-    with col2:
-        sponsor = st.text_input("Sponsor / Manufacturer (optional)")
-        product_code = st.text_input("Product Code (optional)")
-
-    extra_info = st.text_area("Additional context (indications, technology, etc.)")
-
-    default_prompt = f"""
-You are assisting an FDA 510(k) reviewer.
-
-Task:
-1. Search FDA resources (or emulate such search) for:
-   - Device: {device_name}
-   - 510(k) number: {k_number}
-   - Sponsor: {sponsor}
-   - Product code: {product_code}
-2. Synthesize a 3000–4000 word detailed, review-oriented summary.
-3. Provide AT LEAST 5 well-structured markdown tables covering at minimum:
-   - Device overview (trade name, sponsor, 510(k) number, product code, regulation number)
-   - Indications for use and intended population
-   - Technological characteristics and comparison with predicate(s)
-   - Performance testing (bench, animal, clinical) and acceptance criteria
-   - Risks and corresponding risk controls/mitigations
-
-Language: {st.session_state.settings["language"]}.
-
-Use headings that match FDA 510(k) review style.
-"""
-    combined_input = f"""
-=== Device Inputs ===
-Device name: {device_name}
-510(k) number: {k_number}
-Sponsor: {sponsor}
-Product code: {product_code}
-
-Additional context:
-{extra_info}
-"""
-
-    agent_run_ui(
-        agent_id="fda_search_agent",
-        tab_key="510k",
-        default_prompt=default_prompt,
-        default_input_text=combined_input,
-        tab_label_for_history="510(k) Intelligence",
-    )
-
-
-def render_pdf_to_md_tab():
-    st.title("PDF → Markdown Transformer")
-
-    uploaded = st.file_uploader("Upload 510(k) or related PDF", type=["pdf"])
-    if uploaded:
-        col1, col2 = st.columns(2)
-        with col1:
-            num_start = st.number_input("From page", min_value=1, value=1)
-        with col2:
-            num_end = st.number_input("To page", min_value=1, value=10)
-
-        if st.button("Extract Pages"):
-            text = extract_pdf_pages_to_text(uploaded, int(num_start), int(num_end))
-            st.session_state["pdf_raw_text"] = text
-
-    raw_text = st.session_state.get("pdf_raw_text", "")
-    if raw_text:
-        default_prompt = f"""
-You are converting part of a regulatory PDF into markdown.
-
-- Input pages: a 510(k) submission, guidance, or related document excerpt.
-- Goal: produce clean, structured markdown preserving headings, lists,
-  and tables (as markdown tables) as much as reasonably possible.
-- Do not hallucinate content that is not in the text.
-- Clearly separate sections corresponding to major headings.
-
-Language: {st.session_state.settings["language"]}.
-"""
-        agent_run_ui(
-            agent_id="pdf_to_markdown_agent",
-            tab_key="pdf_to_md",
-            default_prompt=default_prompt,
-            default_input_text=raw_text,
-            tab_label_for_history="PDF → Markdown",
-        )
-    else:
-        st.info("Upload a PDF and click 'Extract Pages' to begin.")
-
-
-def render_summary_tab():
-    st.title("Comprehensive Summary & Entities")
-
-    base_md = st.session_state.get("pdf_to_md_output_edited", "")
-    if base_md:
-        default_input = base_md
-    else:
-        default_input = st.text_area("Paste markdown to summarize", value="", height=300)
-
-    default_prompt = f"""
-You are assisting an FDA 510(k) reviewer.
-
-Given the following markdown document (derived from a 510(k) or related
-submission), perform two tasks:
-
-1. Produce a 3000–4000 word high-quality summary structured for a 510(k)
-   review memo. Include sections such as:
-   - Device description
-   - Indications for use
-   - Predicate device comparison
-   - Technological characteristics
-   - Performance testing
-   - Biocompatibility
-   - Sterilization and shelf life
-   - Software / cybersecurity (if applicable)
-   - Risk management
-   - Benefit-risk discussion
-   - Overall assessment / outstanding issues
-
-2. Extract at least 20 key entities and present them in a markdown table with
-   columns:
-   - Entity Type (e.g., Indication, Risk, Test, Mitigation, Design Feature)
-   - Entity Name / Phrase
-   - Context (short excerpt or explanation)
-   - Reviewer Comment / Considerations
-   - Location / Section (if evident)
-
-Language: {st.session_state.settings["language"]}.
-"""
-
-    agent_run_ui(
-        agent_id="summary_entities_agent",
-        tab_key="summary",
-        default_prompt=default_prompt,
-        default_input_text=default_input,
-        tab_label_for_history="Summary & Entities",
-    )
-
-
-def render_diff_tab():
-    st.title("Dual-Version Comparator")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        pdf_old = st.file_uploader("Upload Old Version PDF", type=["pdf"], key="pdf_old")
-    with col2:
-        pdf_new = st.file_uploader("Upload New Version PDF", type=["pdf"], key="pdf_new")
-
-    if pdf_old and pdf_new and st.button("Extract Text for Comparison"):
-        st.session_state["old_text"] = extract_pdf_pages_to_text(pdf_old, 1, 9999)
-        st.session_state["new_text"] = extract_pdf_pages_to_text(pdf_new, 1, 9999)
-
-    old_txt = st.session_state.get("old_text", "")
-    new_txt = st.session_state.get("new_text", "")
-
-    if old_txt and new_txt:
-        combined = f"=== OLD VERSION ===\n{old_txt}\n\n=== NEW VERSION ===\n{new_txt}"
-
-        default_prompt = f"""
-You are comparing two versions of a 510(k)-related document.
-
-Tasks:
-1. Identify at least 100 meaningful differences between the OLD and NEW versions.
-2. Differences may include:
-   - Added/removed/changed text
-   - Updated indications, risks, or test results
-   - New mitigation measures
-   - Changes likely to affect safety or effectiveness
-
-3. Present them in a markdown table with columns:
-   - Title (short label for the difference)
-   - Difference (what changed, including before/after summary)
-   - Reference Pages / Sections (approximate, if possible)
-   - Comments (regulatory significance, potential review impact)
-
-Language: {st.session_state.settings["language"]}.
-"""
-
-        agent_run_ui(
-            agent_id="diff_agent",
-            tab_key="diff",
-            default_prompt=default_prompt,
-            default_input_text=combined,
-            tab_label_for_history="Comparator",
-        )
-
-        st.markdown("---")
-        st.subheader("Run additional agents from agents.yaml on this combined doc")
-
-        agents_cfg = st.session_state["agents_cfg"]
-        agent_ids = list(agents_cfg["agents"].keys())
-        selected_agents = st.multiselect(
-            "Select agents to run on the current combined document",
-            agent_ids,
-        )
-
-        current_text = st.session_state.get("diff_output_edited", combined)
-        for aid in selected_agents:
-            st.markdown(f"#### Agent: {agents_cfg['agents'][aid]['name']}")
-            agent_run_ui(
-                agent_id=aid,
-                tab_key=f"diff_{aid}",
-                default_prompt=agents_cfg["agents"][aid].get("system_prompt", ""),
-                default_input_text=current_text,
-                tab_label_for_history=f"Comparator-{aid}",
-            )
-            current_text = st.session_state.get(f"diff_{aid}_output_edited", current_text)
-    else:
-        st.info("Upload both old and new PDFs, then click 'Extract Text for Comparison'.")
-
-
-def render_checklist_tab():
-    st.title("Review Checklist & Report")
-
-    # Step 1: Checklist (uses guidance_to_checklist_converter in default agents.yaml)
-    st.subheader("Step 1: Provide Review Guidance")
-    guidance_file = st.file_uploader("Upload guidance (PDF/MD/TXT)", type=["pdf", "md", "txt"])
-    guidance_text = ""
-    if guidance_file:
-        if guidance_file.type == "application/pdf":
-            guidance_text = extract_pdf_pages_to_text(guidance_file, 1, 9999)
-        else:
-            guidance_text = guidance_file.read().decode("utf-8", errors="ignore")
-
-    manual_guidance = st.text_area("Or paste guidance text/markdown", height=200)
-    guidance_text = guidance_text or manual_guidance
-
-    if guidance_text:
-        default_prompt = st.session_state["agents_cfg"]["agents"].get(
-            "guidance_to_checklist_converter", {}
-        ).get("user_prompt_template", f"""
-Please generate a comprehensive review checklist based on the following FDA guidance
-document. Create detailed, actionable items grouped by review section.
-
-Guidance:
-{guidance_text}
-""")
-
-        if "guidance_to_checklist_converter" in st.session_state["agents_cfg"]["agents"]:
-            agent_run_ui(
-                agent_id="guidance_to_checklist_converter",
-                tab_key="checklist",
-                default_prompt=default_prompt,
-                default_input_text=guidance_text,
-                tab_label_for_history="Checklist",
-            )
-        else:
-            st.warning("Agent 'guidance_to_checklist_converter' not found in agents.yaml.")
-
-    st.markdown("---")
-    st.subheader("Step 2: Build Review Report")
-
-    checklist_md = st.session_state.get("checklist_output_edited", "")
-    review_results_file = st.file_uploader("Upload review results (TXT/MD)", type=["txt", "md"])
-    review_results_text = ""
-    if review_results_file:
-        review_results_text = review_results_file.read().decode("utf-8", errors="ignore")
-    review_results_manual = st.text_area("Or paste review results", height=200)
-    review_results = review_results_text or review_results_manual
-
-    if checklist_md and review_results:
-        default_prompt = st.session_state["agents_cfg"]["agents"].get(
-            "review_memo_builder", {}
-        ).get("user_prompt_template", f"""
-Please compile the following checklist and review results into a formal FDA 510(k)
-review memorandum.
-
-=== CHECKLIST ===
-{checklist_md}
-
-=== REVIEW RESULTS ===
-{review_results}
-""")
-
-        combined_input = f"=== CHECKLIST ===\n{checklist_md}\n\n=== REVIEW RESULTS ===\n{review_results}"
-
-        if "review_memo_builder" in st.session_state["agents_cfg"]["agents"]:
-            agent_run_ui(
-                agent_id="review_memo_builder",
-                tab_key="review_report",
-                default_prompt=default_prompt,
-                default_input_text=combined_input,
-                tab_label_for_history="Review Report",
-            )
-        else:
-            st.warning("Agent 'review_memo_builder' not found in agents.yaml.")
-    else:
-        st.info("Provide both a checklist and review results to generate a report.")
-
-
-def render_note_keeper_tab():
-    st.title("AI Note Keeper & Magics")
-
-    raw_notes = st.text_area("Paste your notes (text or markdown)", height=300, key="notes_raw")
-    if raw_notes:
-        default_prompt = """
-You are restructuring a 510(k) reviewer's notes into organized markdown.
-
-Tasks:
-1. Identify major sections and sub-sections.
-2. Convert bullet fragments into readable sentences where helpful.
-3. Highlight key points, open questions, and follow-up items.
-4. Avoid inventing information not present in the notes.
-"""
-        agent_run_ui(
-            agent_id="note_keeper_agent",
-            tab_key="notes",
-            default_prompt=default_prompt,
-            default_input_text=raw_notes,
-            tab_label_for_history="Note Keeper",
-        )
-
-    processed = st.session_state.get("notes_output_edited", raw_notes)
-
-    st.markdown("---")
-    st.subheader("AI Magics")
-
-    st.markdown("Select a Magic and apply it to the current note.")
-    magic_options = {
-        "AI Formatting": "magic_formatting_agent",
-        "AI Keywords": "magic_keywords_agent",
-        "AI Action Items": "magic_action_items_agent",
-        "AI Concept Map": "magic_concept_map_agent",
-        "AI Glossary": "magic_glossary_agent",
+def set_stage(stage: str):
+    st.session_state.stage = stage
+    log(f"Stage → {stage}", level="INFO", stage=stage)
+
+
+def should_stop() -> bool:
+    return bool(st.session_state.get("stop_flag", False))
+
+
+def reset_stop():
+    st.session_state.stop_flag = False
+
+
+# ----------------------------
+# Prompt Templates
+# ----------------------------
+
+def default_prompt_templates() -> Dict[str, str]:
+    # Keep prompts editable in UI.
+    return {
+        "summary_system": (
+            "You are Knowledge Agent WOW. You transform multiple converted Markdown sources into a single, "
+            "well-structured integrated Markdown report suitable for Obsidian. "
+            "You must preserve meaning, deduplicate overlaps, and keep provenance.\n"
+        ),
+        "summary_user": (
+            "OUTPUT LANGUAGE: {output_language}\n"
+            "TASK: Create ONE integrated summary in Markdown that synthesizes ALL sources below.\n"
+            "HARD CONSTRAINT: The output MUST be 3000–4000 words (approximate word count).\n"
+            "REQUIREMENTS:\n"
+            "- Add YAML frontmatter at the top with title, language, sources, run_id.\n"
+            "- Use clear headings: Executive Overview, Key Themes (Cross-Document), Document-by-Document Highlights, "
+            "Conflicts/Gaps/Uncertainties, Actionable Insights/Next Steps, Appendix: Source Map.\n"
+            "- Include source references (file names) in a lightweight way.\n"
+            "- Do not include raw logs or tool output.\n\n"
+            "SOURCES (each is already cleaned Markdown):\n"
+            "{sources_block}\n"
+        ),
+        "summary_adjust_length": (
+            "Your previous integrated summary does not meet the 3000–4000 word constraint.\n"
+            "OUTPUT LANGUAGE: {output_language}\n"
+            "Please rewrite the summary to strictly fit 3000–4000 words while keeping the same structure, "
+            "and without losing critical information.\n\n"
+            "CURRENT SUMMARY:\n"
+            "{current_summary}\n"
+        ),
+        "summary_chat": (
+            "Use the integrated summary as the only context. Answer the user's request.\n"
+            "OUTPUT LANGUAGE: {output_language}\n"
+            "If you need to modify the summary, return Markdown that can replace/append to the summary.\n\n"
+            "SUMMARY:\n{summary}\n\n"
+            "USER:\n{user_prompt}\n"
+        ),
+        "magic_system": (
+            "You are Knowledge Agent WOW. Apply a specific transformation (WOW Magic) to the integrated summary. "
+            "Maintain Markdown, preserve factual integrity, and provide actionable structure.\n"
+        ),
+        "magic_user": (
+            "OUTPUT LANGUAGE: {output_language}\n"
+            "MAGIC: {magic_name}\n"
+            "OPTIONAL STYLE: {style}\n"
+            "Apply the magic to the summary below.\n\n"
+            "SUMMARY:\n{summary}\n"
+        ),
+        "note_organize": (
+            "OUTPUT LANGUAGE: {output_language}\n"
+            "Transform the following note (text or markdown) into a well-organized Markdown note.\n"
+            "Add headings, bullet points, and a short TL;DR.\n\n"
+            "NOTE:\n{note}\n"
+        ),
+        "note_magic": (
+            "OUTPUT LANGUAGE: {output_language}\n"
+            "NOTE MAGIC: {magic_name}\n"
+            "If keywords are provided, highlight them using the chosen color style in Markdown/HTML.\n\n"
+            "KEYWORDS: {keywords}\n"
+            "COLOR: {color}\n\n"
+            "NOTE:\n{note}\n"
+        ),
+        "agents_standardize": (
+            "You standardize an agents.yaml configuration.\n"
+            "Return ONLY valid YAML.\n"
+            "If the input is non-standard, transform it into a standardized schema:\n"
+            "agents:\n"
+            "  - name: string\n"
+            "    description: string\n"
+            "    model: string\n"
+            "    prompts:\n"
+            "      system: string\n"
+            "      user: string\n"
+            "    enabled_tools: [string]\n"
+            "    extensions: object\n\n"
+            "INPUT YAML:\n{yaml_text}\n"
+        ),
     }
 
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        magic_name = st.selectbox("Magic", list(magic_options.keys()))
-    with col2:
-        keyword_color = st.color_picker("Keyword color (for AI Keywords)", "#ff7f50")  # coral default
+
+# ----------------------------
+# Workspace / Run Management
+# ----------------------------
+
+def new_run_id() -> str:
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    salt = hashlib.sha1(str(time.time()).encode("utf-8")).hexdigest()[:8]
+    return f"run_{ts}_{salt}"
+
+
+def ensure_dirs(run_id: str) -> Dict[str, str]:
+    base = os.path.join(WORKSPACE_BASE, "raw", "imports", run_id)
+    paths = {
+        "base": base,
+        "inputs": os.path.join(base, "inputs"),
+        "markdown": os.path.join(base, "markdown"),
+        "summary": os.path.join(base, "summary"),
+        "logs": os.path.join(base, "logs"),
+        "meta": os.path.join(base, "meta"),
+        "assets": os.path.join(base, "assets"),
+    }
+    for p in paths.values():
+        os.makedirs(p, exist_ok=True)
+    st.session_state.last_run_artifacts_dir = base
+    return paths
+
+
+def write_run_meta(paths: Dict[str, str], meta: dict):
+    meta_path = os.path.join(paths["meta"], "run.json")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+
+def write_logs(paths: Dict[str, str]):
+    log_path = os.path.join(paths["logs"], "run.log")
+    with open(log_path, "w", encoding="utf-8") as f:
+        for e in st.session_state.logs:
+            f.write(f"[{e['time']}][{e['level']}][{e['stage']}][{e.get('doc_id','')}] {e['msg']}\n")
+
+
+# ----------------------------
+# API Key Policy
+# ----------------------------
+
+def get_env_key(provider: str) -> Optional[str]:
+    for name in ENV_KEY_NAMES.get(provider, []):
+        v = os.environ.get(name)
+        if v and v.strip():
+            return v.strip()
+    return None
+
+
+def get_effective_key(provider: str) -> Optional[str]:
+    env_k = get_env_key(provider)
+    if env_k:
+        return env_k
+    user_k = st.session_state.keys_user.get(provider)
+    if user_k and user_k.strip():
+        return user_k.strip()
+    return None
+
+
+def model_provider(model_name: str) -> str:
+    m = (model_name or "").lower()
+    if m.startswith("gemini"):
+        return "gemini"
+    if m.startswith("gpt-"):
+        return "openai"
+    if m.startswith("claude"):
+        return "anthropic"
+    if m.startswith("grok"):
+        return "grok"
+    # Default heuristic: treat unknown as openai-compatible
+    return "openai"
+
+
+# ----------------------------
+# LLM Invocation (Streaming-first, fallback to non-stream)
+# ----------------------------
+
+@dataclass
+class LLMResult:
+    text: str
+    provider: str
+    model: str
+    usage: dict
+
+
+def _import_openai():
+    try:
+        from openai import OpenAI
+        return OpenAI
+    except Exception:
+        return None
+
+
+def _import_anthropic():
+    try:
+        import anthropic
+        return anthropic
+    except Exception:
+        return None
+
+
+def _import_google_genai():
+    # google-genai (newer) import style
+    try:
+        from google import genai
+        return genai
+    except Exception:
+        return None
+
+
+def llm_stream(system_prompt: str, user_prompt: str, model: str) -> Generator[str, None, LLMResult]:
+    """
+    Yields text chunks for Streamlit rendering.
+    Returns final LLMResult via generator return (StopIteration.value).
+    """
+    provider = model_provider(model)
+    key = get_effective_key(provider)
+    if not key:
+        raise RuntimeError(f"Missing API key for provider: {provider}")
+
+    usage = {}
+    collected = []
+
+    # ---------------- GEMINI ----------------
+    if provider == "gemini":
+        genai = _import_google_genai()
+        if genai is None:
+            raise RuntimeError("google-genai is not installed. Add `google-genai` to requirements.txt.")
+
+        client = genai.Client(api_key=key)
+
+        # Use a simple text call; streaming supported by generate_content_stream
+        contents = [
+            {"role": "system", "parts": [{"text": system_prompt}]},
+            {"role": "user", "parts": [{"text": user_prompt}]},
+        ]
+
+        try:
+            stream = client.models.generate_content_stream(
+                model=model,
+                contents=contents,
+            )
+            for ev in stream:
+                if should_stop():
+                    break
+                chunk = getattr(ev, "text", None) or ""
+                if chunk:
+                    collected.append(chunk)
+                    yield chunk
+        except Exception as e:
+            raise RuntimeError(f"Gemini streaming error: {e}") from e
+
+        text = "".join(collected).strip()
+        return LLMResult(text=text, provider=provider, model=model, usage=usage)
+
+    # ---------------- OPENAI / GROK (OpenAI-compatible for Grok) ----------------
+    if provider in ("openai", "grok"):
+        OpenAI = _import_openai()
+        if OpenAI is None:
+            raise RuntimeError("openai is not installed. Add `openai` to requirements.txt.")
+
+        # Grok uses xAI OpenAI-compatible base URL
+        if provider == "grok":
+            client = OpenAI(api_key=key, base_url=os.environ.get("XAI_BASE_URL", "https://api.x.ai/v1"))
+        else:
+            client = OpenAI(api_key=key)
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                stream=True,
+            )
+            for event in resp:
+                if should_stop():
+                    break
+                delta = ""
+                try:
+                    delta = event.choices[0].delta.content or ""
+                except Exception:
+                    delta = ""
+                if delta:
+                    collected.append(delta)
+                    yield delta
+        except Exception as e:
+            raise RuntimeError(f"{provider} streaming error: {e}") from e
+
+        text = "".join(collected).strip()
+        return LLMResult(text=text, provider=provider, model=model, usage=usage)
+
+    # ---------------- ANTHROPIC ----------------
+    if provider == "anthropic":
+        anthropic = _import_anthropic()
+        if anthropic is None:
+            raise RuntimeError("anthropic is not installed. Add `anthropic` to requirements.txt.")
+
+        client = anthropic.Anthropic(api_key=key)
+
+        try:
+            with client.messages.stream(
+                model=model,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+                max_tokens=4096,
+            ) as stream:
+                for text in stream.text_stream:
+                    if should_stop():
+                        break
+                    if text:
+                        collected.append(text)
+                        yield text
+        except Exception as e:
+            raise RuntimeError(f"Anthropic streaming error: {e}") from e
+
+        text = "".join(collected).strip()
+        return LLMResult(text=text, provider=provider, model=model, usage=usage)
+
+    raise RuntimeError(f"Unknown provider for model: {model}")
+
+
+def run_llm(system_prompt: str, user_prompt: str, model: str, stream_to_ui: bool = True) -> LLMResult:
+    """
+    Wrapper that streams to UI if requested, otherwise collects internally.
+    """
+    gen = llm_stream(system_prompt, user_prompt, model)
+    collected = []
+    if stream_to_ui:
+        placeholder = st.empty()
+        buf = ""
+
+        try:
+            for chunk in gen:
+                buf += chunk
+                # Keep UI responsive but not too slow
+                placeholder.markdown(buf)
+                collected.append(chunk)
+        except Exception:
+            # ensure exception is visible
+            raise
+        try:
+            result = gen.send(None)  # finalize
+            return result
+        except StopIteration as si:
+            return si.value
+    else:
+        try:
+            for chunk in gen:
+                collected.append(chunk)
+        except Exception:
+            raise
+        try:
+            result = gen.send(None)
+            return result
+        except StopIteration as si:
+            return si.value
+
+
+# ----------------------------
+# Document Handling / Conversion (skill.md-inspired)
+# ----------------------------
+
+def slugify(name: str) -> str:
+    name = re.sub(r"[^\w\s\-\u4e00-\u9fff\u3040-\u30ff\u3400-\u4dbf]", "", name, flags=re.UNICODE)
+    name = re.sub(r"\s+", " ", name).strip()
+    name = name.replace(" ", "_")
+    return name[:120] if name else "untitled"
+
+
+def pangu_spacing(text: str) -> str:
+    # Minimal CJK/ASCII spacing heuristic (lightweight)
+    # Insert space between CJK and ASCII when adjacent.
+    def is_cjk(ch):
+        return (
+            "\u4e00" <= ch <= "\u9fff"
+            or "\u3400" <= ch <= "\u4dbf"
+            or "\u3040" <= ch <= "\u30ff"
+        )
+
+    out = []
+    for i, ch in enumerate(text):
+        if i > 0:
+            prev = text[i - 1]
+            if (is_cjk(prev) and re.match(r"[A-Za-z0-9]", ch)) or (re.match(r"[A-Za-z0-9]", prev) and is_cjk(ch)):
+                if out and out[-1] != " ":
+                    out.append(" ")
+        out.append(ch)
+    return "".join(out)
+
+
+def cleanup_common(md: str) -> str:
+    md = md.replace("------", "——")
+    # remove pandoc attributes patterns
+    md = re.sub(r"\{\.[^}]+\}", "", md)
+    md = re.sub(r"\[\]\{#[^\}]+\}", "", md)
+    md = re.sub(r":::.*?\n", "", md)
+    md = re.sub(r"\.immersive-translate-[\w\-]+", "", md)
+    md = re.sub(r"\.notranslate", "", md)
+    # compress blank lines
+    md = re.sub(r"\n{3,}", "\n\n", md)
+    md = pangu_spacing(md)
+    return md.strip() + "\n"
+
+
+def detect_title_from_md(md: str, fallback: str) -> str:
+    m = re.search(r"^\s*#\s+(.+?)\s*$", md, flags=re.M)
+    if m:
+        return m.group(1).strip()
+    return fallback
+
+
+def build_frontmatter(title: str, source_filename: str, doc_type: str, origin: str = "external") -> str:
+    fm = {
+        "title": title,
+        "origin": origin,
+        "type": doc_type,
+        "source_filename": source_filename,
+        "created_at": now_iso(),
+    }
+    y = yaml.safe_dump(fm, allow_unicode=True, sort_keys=False).strip()
+    return f"---\n{y}\n---\n\n"
+
+
+def convert_txt_to_md(text: str, filename: str) -> Tuple[str, dict]:
+    raw = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    # Heuristic headings: lines that look like "1. Title" or "CHAPTER X" or all-caps > 6 chars
+    lines = raw.split("\n")
+    out = []
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            out.append("")
+            continue
+        if re.match(r"^\d+(\.\d+)*\s+.+", s) and len(s) < 120:
+            out.append("## " + s)
+        elif re.match(r"^(chapter|section)\s+\d+", s.lower()) and len(s) < 120:
+            out.append("## " + s)
+        elif (s.isupper() and len(s) >= 8 and len(s) < 80 and re.search(r"[A-Z]", s)):
+            out.append("## " + s.title())
+        else:
+            out.append(s)
+    md_body = "\n".join(out)
+    md_body = cleanup_common(md_body)
+    title = detect_title_from_md(md_body, os.path.splitext(filename)[0])
+    md = build_frontmatter(title=title, source_filename=filename, doc_type="document") + md_body
+    metrics = {
+        "title": title,
+        "chars": len(md),
+        "words_est": len(re.findall(r"\S+", md_body)),
+        "format": "txt",
+    }
+    return md, metrics
+
+
+def convert_md_to_md(md: str, filename: str) -> Tuple[str, dict]:
+    body = md.replace("\r\n", "\n").replace("\r", "\n").strip()
+    # If user already has frontmatter, keep it, but ensure required keys exist.
+    # For simplicity, we preserve content; we also prepend a standardized frontmatter if none exists.
+    has_fm = body.startswith("---\n") and ("\n---\n" in body[4:])
+    if not has_fm:
+        title = detect_title_from_md(body, os.path.splitext(filename)[0])
+        body = cleanup_common(body)
+        out = build_frontmatter(title=title, source_filename=filename, doc_type="document") + body
+    else:
+        # still cleanup body lightly (but avoid breaking YAML by not touching top block)
+        parts = body.split("\n---\n", 1)
+        fm = parts[0] + "\n---\n"
+        rest = parts[1] if len(parts) > 1 else ""
+        rest = cleanup_common(rest)
+        title = detect_title_from_md(rest, os.path.splitext(filename)[0])
+        out = fm + "\n" + rest
+    metrics = {
+        "title": detect_title_from_md(out, os.path.splitext(filename)[0]),
+        "chars": len(out),
+        "words_est": len(re.findall(r"\S+", out)),
+        "format": "md",
+    }
+    return out, metrics
+
+
+def extract_pdf_text_pymupdf(pdf_bytes: bytes, filename: str) -> Tuple[str, dict]:
+    if fitz is None:
+        raise RuntimeError("PyMuPDF is not installed. Add `pymupdf` to requirements.txt.")
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    meta = doc.metadata or {}
+    title = (meta.get("title") or "").strip() or os.path.splitext(filename)[0]
+
+    # TOC-based headings if available
+    toc = doc.get_toc()  # list of [level, title, page]
+    toc_map = {}  # page_index -> list of (level, title)
+    for level, t, page in toc:
+        idx = max(0, int(page) - 1)
+        toc_map.setdefault(idx, []).append((level, t))
+
+    page_texts = []
+    header_candidates = {}
+    footer_candidates = {}
+
+    for i in range(doc.page_count):
+        if should_stop():
+            break
+
+        page = doc.load_page(i)
+        text = page.get_text("text") or ""
+        text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+        # Capture potential headers/footers (first/last non-empty lines)
+        lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+        if lines:
+            header_candidates[lines[0]] = header_candidates.get(lines[0], 0) + 1
+            footer_candidates[lines[-1]] = footer_candidates.get(lines[-1], 0) + 1
+
+        page_texts.append(lines)
+
+    # Heuristic: remove frequent header/footer lines
+    header_to_remove = {k for k, v in header_candidates.items() if v >= max(3, doc.page_count // 3)}
+    footer_to_remove = {k for k, v in footer_candidates.items() if v >= max(3, doc.page_count // 3)}
+
+    out_lines = []
+    removed_hf = 0
+    removed_pageno = 0
+
+    for i, lines in enumerate(page_texts):
+        if should_stop():
+            break
+
+        # Insert TOC headings at page start
+        if i in toc_map:
+            for level, t in toc_map[i]:
+                if not t.strip():
+                    continue
+                hashes = "##" if level == 1 else "###" if level == 2 else "####"
+                out_lines.append(f"{hashes} {t.strip()}")
+                out_lines.append("")
+
+        for ln in lines:
+            if ln in header_to_remove or ln in footer_to_remove:
+                removed_hf += 1
+                continue
+            # remove standalone page number lines
+            if re.match(r"^\d{1,4}$", ln):
+                removed_pageno += 1
+                continue
+            # remove PUA noise lines
+            if re.search(r"[\ue000-\uf8ff]", ln):
+                removed_pageno += 1
+                continue
+            out_lines.append(ln)
+        out_lines.append("")
+
+    md_body = "\n".join(out_lines)
+    md_body = cleanup_common(md_body)
+
+    md = build_frontmatter(title=title, source_filename=filename, doc_type="report") + md_body
+    metrics = {
+        "title": title,
+        "chars": len(md),
+        "words_est": len(re.findall(r"\S+", md_body)),
+        "format": "pdf",
+        "pages": doc.page_count,
+        "removed_headers_footers": removed_hf,
+        "removed_page_numbers": removed_pageno,
+        "toc_entries": len(toc),
+    }
+    doc.close()
+    return md, metrics
+
+
+def convert_document(file_entry: dict, paths: Dict[str, str]) -> Tuple[str, dict, str]:
+    """
+    Returns: (markdown_text, metrics, output_path)
+    """
+    fid = file_entry["id"]
+    filename = file_entry["name"]
+    ext = file_entry["ext"].lower()
+
+    set_stage("Converting")
+    log(f"Converting {filename}", doc_id=fid, stage="Converting")
+
+    if ext == ".pdf":
+        md, metrics = extract_pdf_text_pymupdf(file_entry["bytes"], filename)
+    elif ext == ".txt":
+        md, metrics = convert_txt_to_md(file_entry["text"], filename)
+    elif ext == ".md":
+        md, metrics = convert_md_to_md(file_entry["text"], filename)
+    else:
+        raise RuntimeError(f"Unsupported file type: {ext}")
+
+    # Write markdown file
+    title_slug = slugify(metrics.get("title") or os.path.splitext(filename)[0])
+    out_name = f"{title_slug}.md"
+    out_path = os.path.join(paths["markdown"], out_name)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(md)
+
+    log(f"Wrote Markdown → {out_name}", doc_id=fid, stage="Converting")
+    return md, metrics, out_path
+
+
+# ----------------------------
+# Summary Assembly
+# ----------------------------
+
+def build_sources_block(converted: Dict[str, str], queue: List[dict]) -> str:
+    parts = []
+    for fe in queue:
+        fid = fe["id"]
+        if fid not in converted:
+            continue
+        label = fe["name"]
+        parts.append(f"\n\n---\n# SOURCE: {label}\n---\n\n{converted[fid]}\n")
+    return "\n".join(parts).strip()
+
+
+def word_count_approx(text: str) -> int:
+    # Works for English + CJK approximations (counts tokens separated by whitespace; CJK may be undercounted).
+    # Still useful for enforcement loop.
+    return len(re.findall(r"\S+", text))
+
+
+def ensure_summary_length(summary_md: str, output_language: str, model: str, max_rounds: int = 2) -> str:
+    wc = word_count_approx(summary_md)
+    if 3000 <= wc <= 4000:
+        return summary_md
+
+    log(f"Summary word count ~{wc} (needs 3000–4000). Attempting adjustment.", level="WARN", stage="Summarizing")
+
+    system_p = st.session_state.prompt_templates["summary_system"]
+    for _ in range(max_rounds):
+        if should_stop():
+            break
+        user_p = st.session_state.prompt_templates["summary_adjust_length"].format(
+            output_language=output_language,
+            current_summary=summary_md,
+        )
+        result = run_llm(system_p, user_p, model=model, stream_to_ui=True)
+        summary_md = result.text.strip()
+        wc = word_count_approx(summary_md)
+        log(f"Adjusted summary word count ~{wc}", stage="Summarizing")
+        if 3000 <= wc <= 4000:
+            return summary_md
+
+    return summary_md
+
+
+def save_summary(paths: Dict[str, str], summary_md: str) -> str:
+    out_path = os.path.join(paths["summary"], "summary.md")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(summary_md)
+    return out_path
+
+
+def add_summary_version(name: str, text: str, meta: dict):
+    vid = hashlib.sha1((name + str(time.time())).encode("utf-8")).hexdigest()[:10]
+    st.session_state.summary_versions.append({
+        "id": vid,
+        "name": name,
+        "text": text,
+        "created_at": now_iso(),
+        "meta": meta,
+    })
+    st.session_state.active_summary_id = vid
+
+
+def get_active_summary_text() -> str:
+    sid = st.session_state.active_summary_id
+    for v in st.session_state.summary_versions[::-1]:
+        if v["id"] == sid:
+            return v["text"]
+    # fallback last
+    if st.session_state.summary_versions:
+        return st.session_state.summary_versions[-1]["text"]
+    return ""
+
+
+# ----------------------------
+# Magics (Summary)
+# ----------------------------
+
+def run_summary_magic(magic_name: str, style: str):
+    summary = get_active_summary_text().strip()
+    if not summary:
+        st.error("No active summary found. Generate a summary first.")
+        return
+
+    set_stage("Magic")
+    log(f"Running magic: {magic_name}", stage="Magic")
+
+    system_p = st.session_state.prompt_templates["magic_system"]
+    user_p = st.session_state.prompt_templates["magic_user"].format(
+        output_language=st.session_state.output_language,
+        magic_name=magic_name,
+        style=style or "None",
+        summary=summary,
+    )
+
+    model = st.session_state.model_by_feature.get("summary_magic", st.session_state.model_global)
+    result = run_llm(system_p, user_p, model=model, stream_to_ui=True)
+    out = result.text.strip()
+
+    add_summary_version(
+        name=f"Magic: {magic_name}",
+        text=out,
+        meta={"magic": magic_name, "style": style, "model": model, "provider": result.provider},
+    )
+    st.session_state.magic_outputs.append({
+        "time": now_iso(),
+        "magic": magic_name,
+        "style": style,
+        "model": model,
+        "text": out,
+    })
+    log(f"Magic completed: {magic_name}", level="SUCCESS", stage="Magic")
+
+
+# ----------------------------
+# Note Keeper
+# ----------------------------
+
+def add_note_version(name: str, text: str, meta: dict):
+    vid = hashlib.sha1((name + str(time.time())).encode("utf-8")).hexdigest()[:10]
+    st.session_state.note_versions.append({
+        "id": vid,
+        "name": name,
+        "text": text,
+        "created_at": now_iso(),
+        "meta": meta,
+    })
+
+
+def run_note_organize(note_text: str):
+    if not note_text.strip():
+        st.error("Please paste a note first.")
+        return
+    set_stage("NoteKeeper")
+    log("Organizing note", stage="NoteKeeper")
+    model = st.session_state.model_by_feature.get("note_keeper", st.session_state.model_global)
+    system_p = "You are a precise note organizer."
+    user_p = st.session_state.prompt_templates["note_organize"].format(
+        output_language=st.session_state.output_language,
+        note=note_text,
+    )
+    result = run_llm(system_p, user_p, model=model, stream_to_ui=True)
+    out = result.text.strip()
+    add_note_version("Organized Note", out, {"model": model, "provider": result.provider})
+    log("Note organized", level="SUCCESS", stage="NoteKeeper")
+
+
+def run_note_magic(note_text: str, magic_name: str, keywords: str = "", color: str = "yellow"):
+    if not note_text.strip():
+        st.error("Please paste or select a note first.")
+        return
+    set_stage("NoteKeeper")
+    log(f"Running note magic: {magic_name}", stage="NoteKeeper")
+    model = st.session_state.model_by_feature.get("note_keeper", st.session_state.model_global)
+    system_p = "You are an Obsidian-focused note transformer."
+    user_p = st.session_state.prompt_templates["note_magic"].format(
+        output_language=st.session_state.output_language,
+        magic_name=magic_name,
+        keywords=keywords or "",
+        color=color or "yellow",
+        note=note_text,
+    )
+    result = run_llm(system_p, user_p, model=model, stream_to_ui=True)
+    out = result.text.strip()
+    add_note_version(f"Note Magic: {magic_name}", out, {"magic": magic_name, "model": model, "provider": result.provider})
+    log(f"Note magic completed: {magic_name}", level="SUCCESS", stage="NoteKeeper")
+
+
+# ----------------------------
+# agents.yaml standardization
+# ----------------------------
+
+def deterministic_standardize_agents_yaml(yaml_text: str) -> Tuple[str, str]:
+    """
+    Attempts a deterministic standardization without LLM.
+    If parsing fails, return original and a report.
+    """
+    report = []
+    try:
+        data = yaml.safe_load(yaml_text) if yaml_text.strip() else None
+    except Exception as e:
+        return yaml_text, f"YAML parse error; cannot deterministic-standardize: {e}"
+
+    if data is None:
+        std = {"agents": []}
+        return yaml.safe_dump(std, allow_unicode=True, sort_keys=False), "Empty YAML → standardized to {agents: []}"
+
+    # If already has 'agents' list with required keys, keep but fill defaults
+    agents = None
+    if isinstance(data, dict) and "agents" in data and isinstance(data["agents"], list):
+        agents = data["agents"]
+        report.append("Detected top-level 'agents' list.")
+    elif isinstance(data, list):
+        agents = data
+        report.append("Detected YAML as a list → treating as agents list.")
+    elif isinstance(data, dict):
+        # attempt to find plausible agent list
+        for k, v in data.items():
+            if isinstance(v, list) and v and isinstance(v[0], dict):
+                agents = v
+                report.append(f"Guessed agents list from key '{k}'.")
+                break
+
+    if agents is None:
+        # Wrap unknown structure
+        std = {
+            "agents": [{
+                "name": "default",
+                "description": "Auto-wrapped agent",
+                "model": st.session_state.model_global,
+                "prompts": {"system": "", "user": ""},
+                "enabled_tools": [],
+                "extensions": data,
+            }]
+        }
+        report.append("Could not infer agent structure → wrapped into default agent with extensions.")
+        return yaml.safe_dump(std, allow_unicode=True, sort_keys=False), "\n".join(report)
+
+    std_agents = []
+    for i, a in enumerate(agents):
+        if not isinstance(a, dict):
+            std_agents.append({
+                "name": f"agent_{i+1}",
+                "description": "Auto-converted from non-dict",
+                "model": st.session_state.model_global,
+                "prompts": {"system": "", "user": str(a)},
+                "enabled_tools": [],
+                "extensions": {},
+            })
+            report.append(f"Agent {i+1}: non-dict converted.")
+            continue
+
+        name = a.get("name") or a.get("id") or a.get("agent") or f"agent_{i+1}"
+        desc = a.get("description") or a.get("desc") or ""
+        model = a.get("model") or a.get("llm") or st.session_state.model_global
+
+        prompts = a.get("prompts")
+        if not isinstance(prompts, dict):
+            prompts = {"system": a.get("system", ""), "user": a.get("prompt", a.get("user", ""))}
+        prompts.setdefault("system", "")
+        prompts.setdefault("user", "")
+
+        tools = a.get("enabled_tools") or a.get("tools") or []
+        if not isinstance(tools, list):
+            tools = [str(tools)]
+
+        extensions = {k: v for k, v in a.items() if k not in {"name", "id", "agent", "description", "desc", "model", "llm", "prompts", "system", "user", "prompt", "enabled_tools", "tools"}}
+
+        std_agents.append({
+            "name": str(name),
+            "description": str(desc),
+            "model": str(model),
+            "prompts": {"system": str(prompts.get("system", "")), "user": str(prompts.get("user", ""))},
+            "enabled_tools": [str(x) for x in tools],
+            "extensions": extensions,
+        })
+
+    std = {"agents": std_agents}
+    return yaml.safe_dump(std, allow_unicode=True, sort_keys=False), "\n".join(report) or "Standardized successfully."
+
+
+def llm_standardize_agents_yaml(yaml_text: str) -> Tuple[str, str]:
+    """
+    Uses LLM to standardize; returns (yaml, report).
+    """
+    set_stage("agents.yaml")
+    log("Standardizing agents.yaml with LLM", stage="agents.yaml")
+    model = st.session_state.model_by_feature.get("agents_standardize", st.session_state.model_global)
+    system_p = "You are a YAML configuration expert. Return only YAML."
+    user_p = st.session_state.prompt_templates["agents_standardize"].format(yaml_text=yaml_text)
+    result = run_llm(system_p, user_p, model=model, stream_to_ui=True)
+    out = result.text.strip()
+    # Basic validation
+    try:
+        _ = yaml.safe_load(out)
+        report = f"LLM-standardized successfully (model={model}, provider={result.provider})."
+    except Exception as e:
+        report = f"LLM output was not valid YAML: {e}. Returning raw output for manual fix."
+    return out, report
+
+
+# ----------------------------
+# Dashboard Visualizations (lightweight heuristics)
+# ----------------------------
+
+def _df_timeline() -> pd.DataFrame:
+    ev = st.session_state.timeline_events
+    if not ev:
+        return pd.DataFrame(columns=["t", "stage", "doc_id", "level", "msg"])
+    t0 = min(e["time"] for e in ev)
+    rows = []
+    for e in ev:
+        rows.append({
+            "t": e["time"] - t0,
+            "stage": e["stage"],
+            "doc_id": e["doc_id"] or "",
+            "level": e["level"],
+            "msg": e["msg"],
+        })
+    return pd.DataFrame(rows)
+
+
+def viz_run_timeline():
+    df = _df_timeline()
+    if df.empty:
+        st.info("No timeline events yet.")
+        return
+    chart = alt.Chart(df).mark_circle(size=60).encode(
+        x=alt.X("t:Q", title="Time (s since start)"),
+        y=alt.Y("stage:N", title="Stage"),
+        color=alt.Color("level:N"),
+        tooltip=["t", "stage", "doc_id", "level", "msg"],
+    ).properties(height=260)
+    st.altair_chart(chart, use_container_width=True)
+    st.dataframe(df.tail(50), use_container_width=True)
+
+
+def viz_source_contribution_heatmap():
+    # Heuristic: measure overlap of top terms from each source with each summary section.
+    summary = get_active_summary_text()
+    if not summary.strip():
+        st.info("Generate a summary first.")
+        return
+    sources = []
+    for fe in st.session_state.queue:
+        fid = fe["id"]
+        if fid in st.session_state.converted:
+            sources.append((fe["name"], st.session_state.converted[fid]))
+
+    if not sources:
+        st.info("No converted sources found.")
+        return
+
+    sections = re.split(r"\n(?=##\s+)", summary)
+    section_titles = []
+    section_texts = []
+    for sec in sections:
+        m = re.match(r"^##\s+(.+)", sec.strip())
+        title = m.group(1).strip() if m else "Frontmatter/Intro"
+        section_titles.append(title[:50])
+        section_texts.append(sec)
+
+    def top_terms(text, k=30):
+        words = re.findall(r"[A-Za-z]{3,}|\u4e00-\u9fff", text)
+        words = [w.lower() for w in re.findall(r"[A-Za-z]{3,}", text)]
+        freq = {}
+        for w in words:
+            freq[w] = freq.get(w, 0) + 1
+        return set(sorted(freq, key=freq.get, reverse=True)[:k])
+
+    src_terms = {name: top_terms(txt, 40) for name, txt in sources}
+    rows = []
+    for s_title, s_txt in zip(section_titles, section_texts):
+        sec_terms = top_terms(s_txt, 40)
+        for src_name, _ in sources:
+            overlap = len(sec_terms & src_terms[src_name])
+            rows.append({"Section": s_title, "Source": src_name, "OverlapScore": overlap})
+
+    df = pd.DataFrame(rows)
+    heat = alt.Chart(df).mark_rect().encode(
+        x=alt.X("Source:N", sort=None),
+        y=alt.Y("Section:N", sort=None),
+        color=alt.Color("OverlapScore:Q"),
+        tooltip=["Section", "Source", "OverlapScore"],
+    ).properties(height=320)
+    st.altair_chart(heat, use_container_width=True)
+
+
+def viz_topic_map():
+    summary = get_active_summary_text()
+    if not summary.strip():
+        st.info("Generate a summary first.")
+        return
+
+    # Basic term frequency for English words; CJK topic modeling is out of scope here.
+    words = re.findall(r"[A-Za-z]{3,}", summary.lower())
+    stop = set(["the", "and", "for", "with", "that", "this", "from", "into", "are", "was", "were", "have", "has"])
+    freq = {}
+    for w in words:
+        if w in stop:
+            continue
+        freq[w] = freq.get(w, 0) + 1
+
+    items = sorted(freq.items(), key=lambda x: x[1], reverse=True)[:40]
+    if not items:
+        st.info("Not enough English terms to build a topic map (try English output or mixed content).")
+        return
+    df = pd.DataFrame(items, columns=["term", "count"])
+    chart = alt.Chart(df).mark_bar().encode(
+        x=alt.X("count:Q", title="Frequency"),
+        y=alt.Y("term:N", sort="-x", title="Term"),
+        tooltip=["term", "count"],
+    ).properties(height=520)
+    st.altair_chart(chart, use_container_width=True)
+
+
+def viz_entity_network():
+    # Heuristic co-occurrence network from capitalized tokens (English) or bracket links [[...]].
+    summary = get_active_summary_text()
+    if not summary.strip():
+        st.info("Generate a summary first.")
+        return
+
+    links = re.findall(r"\[\[([^\]]+)\]\]", summary)
+    caps = re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}\b", summary)
+    entities = links + caps
+    entities = [e.strip() for e in entities if 2 <= len(e.strip()) <= 40]
+    if not entities:
+        st.info("No entities detected (try applying Obsidian Linksmith magic first).")
+        return
+
+    # Sliding window co-occurrence
+    tokens = re.split(r"[\n\.]+", summary)
+    edges = {}
+    for sent in tokens:
+        present = set()
+        for e in entities[:300]:  # cap for performance
+            if e in sent:
+                present.add(e)
+        present = list(present)
+        for i in range(len(present)):
+            for j in range(i + 1, len(present)):
+                a, b = sorted([present[i], present[j]])
+                edges[(a, b)] = edges.get((a, b), 0) + 1
+
+    top_edges = sorted(edges.items(), key=lambda x: x[1], reverse=True)[:80]
+    if not top_edges:
+        st.info("Not enough co-occurrence edges to visualize.")
+        return
+
+    df = pd.DataFrame([{"a": a, "b": b, "w": w} for (a, b), w in top_edges])
+    st.dataframe(df, use_container_width=True)
+    st.caption("Heuristic network: edges represent co-occurrence within the same sentence/segment.")
+
+
+def viz_risk_radar():
+    summary = get_active_summary_text()
+    if not summary.strip():
+        st.info("Generate a summary first.")
+        return
+    # Heuristic risk scoring via keyword hits
+    text = summary.lower()
+    categories = {
+        "Uncertainty": ["uncertain", "unknown", "uncertainty", "未確定", "不確定", "未知"],
+        "Conflict": ["contradiction", "conflict", "inconsistent", "矛盾", "衝突", "不一致"],
+        "Missing Data": ["missing", "lack", "insufficient", "不足", "缺少", "欠缺"],
+        "Bias/Assumption": ["assume", "assumption", "bias", "假設", "偏誤", "偏差"],
+        "Operational Risk": ["risk", "failure", "issue", "風險", "失敗", "問題"],
+    }
+    rows = []
+    for cat, kws in categories.items():
+        score = 0
+        for kw in kws:
+            score += text.count(kw.lower())
+        rows.append({"category": cat, "score": min(score, 30)})
+    df = pd.DataFrame(rows)
+    chart = alt.Chart(df).mark_bar().encode(
+        x=alt.X("score:Q", title="Heuristic Score (capped)"),
+        y=alt.Y("category:N", sort="-x"),
+        tooltip=["category", "score"],
+    ).properties(height=240)
+    st.altair_chart(chart, use_container_width=True)
+    st.caption("This is a heuristic indicator, not a factual risk assessment.")
+
+
+def viz_version_diff():
+    versions = st.session_state.summary_versions
+    if len(versions) < 2:
+        st.info("Need at least 2 summary versions to diff (generate summary, then apply a magic).")
+        return
+
+    vnames = [f"{v['created_at']} — {v['name']} ({v['id']})" for v in versions]
+    a = st.selectbox("Version A", vnames, index=max(0, len(vnames) - 2))
+    b = st.selectbox("Version B", vnames, index=len(vnames) - 1)
+
+    ida = a.split("(")[-1].split(")")[0]
+    idb = b.split("(")[-1].split(")")[0]
+
+    ta = next(v["text"] for v in versions if v["id"] == ida)
+    tb = next(v["text"] for v in versions if v["id"] == idb)
+
+    # Lightweight diff: show changed lines counts + excerpts
+    la = ta.splitlines()
+    lb = tb.splitlines()
+
+    set_a = set(la)
+    set_b = set(lb)
+    removed = [x for x in la if x not in set_b]
+    added = [x for x in lb if x not in set_a]
+
+    st.write(f"Removed lines: {len(removed)} | Added lines: {len(added)}")
+    st.subheader("Added (sample)")
+    st.code("\n".join(added[:80]) or "(none)")
+    st.subheader("Removed (sample)")
+    st.code("\n".join(removed[:80]) or "(none)")
+
+
+# ----------------------------
+# Export Packager
+# ----------------------------
+
+def build_export_zip(artifacts_dir: str) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for root, _, files in os.walk(artifacts_dir):
+            for fn in files:
+                full = os.path.join(root, fn)
+                rel = os.path.relpath(full, artifacts_dir)
+                z.write(full, arcname=rel)
+    return buf.getvalue()
+
+
+# ----------------------------
+# UI Components
+# ----------------------------
+
+def render_header():
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
+    st.title(APP_TITLE)
+
+    cols = st.columns([1.2, 1.1, 1.2, 1.5])
+    with cols[0]:
+        st.session_state.theme = st.selectbox("Theme", ["Light", "Dark"], index=0 if st.session_state.theme == "Light" else 1)
+    with cols[1]:
+        st.session_state.ui_language = st.selectbox("UI Language", ["Traditional Chinese", "English"], index=0 if st.session_state.ui_language == "Traditional Chinese" else 1)
+    with cols[2]:
+        st.session_state.output_language = st.selectbox("Output Language", OUTPUT_LANGUAGES, index=0 if st.session_state.output_language == DEFAULT_OUTPUT_LANGUAGE else 1)
+    with cols[3]:
+        st.session_state.model_global = st.selectbox("Global Model Default", MODEL_OPTIONS, index=MODEL_OPTIONS.index(st.session_state.model_global) if st.session_state.model_global in MODEL_OPTIONS else 0)
+
+    # WOW indicator
+    st.info(f"WOW Indicator — Stage: **{st.session_state.stage}** | Run: **{st.session_state.run_id or 'N/A'}**")
+
+
+def render_sidebar_settings():
+    with st.sidebar:
+        st.header("Settings & Keys")
+
+        # Keys panel respecting env visibility rule
+        for provider in ["gemini", "openai", "anthropic", "grok"]:
+            env_k = get_env_key(provider)
+            if env_k:
+                st.success(f"{provider.upper()} key: configured via environment")
+            else:
+                st.session_state.keys_user[provider] = st.text_input(
+                    f"{provider.upper()} API Key",
+                    type="password",
+                    value=st.session_state.keys_user.get(provider, ""),
+                    help="Stored in session only. Not displayed once set.",
+                )
+
+        st.divider()
+        st.subheader("Feature Models")
+        for feat in ["summary", "summary_chat", "summary_magic", "note_keeper", "agents_standardize"]:
+            st.session_state.model_by_feature[feat] = st.selectbox(
+                f"Model for {feat}",
+                MODEL_OPTIONS,
+                index=MODEL_OPTIONS.index(st.session_state.model_by_feature.get(feat, st.session_state.model_global))
+                if st.session_state.model_by_feature.get(feat, st.session_state.model_global) in MODEL_OPTIONS else 0
+            )
+
+        st.divider()
+        st.subheader("Painter Style (optional)")
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            st.session_state.painter_style = st.selectbox("Style", ["None"] + PAINTER_STYLES, index=0)
+        with c2:
+            if st.button("Jackpot"):
+                import random
+                st.session_state.painter_style = random.choice(PAINTER_STYLES)
+                st.rerun()
+
+        st.divider()
+        st.subheader("Run Control")
+        if st.button("Stop / Cancel"):
+            st.session_state.stop_flag = True
+            log("User requested stop.", level="WARN")
+        if st.button("Reset Stop Flag"):
+            reset_stop()
+            log("Stop flag reset.", level="INFO")
+
+        st.divider()
+        if st.button("Clear Session Outputs"):
+            for k in ["logs", "queue", "converted", "converted_paths", "summary_versions", "magic_outputs", "timeline_events", "doc_metrics"]:
+                st.session_state[k] = [] if isinstance(st.session_state.get(k), list) else {}
+            st.session_state.run_id = None
+            st.session_state.active_summary_id = None
+            st.session_state.stage = "Idle"
+            log("Session outputs cleared.", level="INFO")
+
+
+def render_logs():
+    st.subheader("Live Log")
+    logs = st.session_state.logs[-300:]
+    txt = "\n".join([f"[{e['time']}][{e['level']}][{e['stage']}][{e.get('doc_id','')}] {e['msg']}" for e in logs])
+    st.code(txt or "(no logs yet)", language="text")
+
+
+def render_prompt_editor():
+    st.subheader("Prompt Studio (Editable)")
+    pt = st.session_state.prompt_templates
+    with st.expander("Summary Prompts", expanded=False):
+        pt["summary_system"] = st.text_area("Summary System Prompt", pt["summary_system"], height=140)
+        pt["summary_user"] = st.text_area("Summary User Prompt Template", pt["summary_user"], height=220)
+        pt["summary_adjust_length"] = st.text_area("Summary Adjust-Length Prompt Template", pt["summary_adjust_length"], height=160)
+        pt["summary_chat"] = st.text_area("Summary Chat Prompt Template", pt["summary_chat"], height=180)
+    with st.expander("Magic Prompts", expanded=False):
+        pt["magic_system"] = st.text_area("Magic System Prompt", pt["magic_system"], height=120)
+        pt["magic_user"] = st.text_area("Magic User Prompt Template", pt["magic_user"], height=140)
+    with st.expander("Note Keeper Prompts", expanded=False):
+        pt["note_organize"] = st.text_area("Note Organize Prompt Template", pt["note_organize"], height=140)
+        pt["note_magic"] = st.text_area("Note Magic Prompt Template", pt["note_magic"], height=180)
+    with st.expander("agents.yaml Standardization Prompt", expanded=False):
+        pt["agents_standardize"] = st.text_area("agents.yaml Standardize Prompt Template", pt["agents_standardize"], height=220)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Reset Prompts to Defaults"):
+            st.session_state.prompt_templates = default_prompt_templates()
+            log("Prompt templates reset to defaults.", level="INFO")
+            st.rerun()
+    with c2:
+        st.caption("Tip: keep constraints explicit (word count, Markdown-only, structure).")
+
+
+# ----------------------------
+# Main Pipeline UI: Convert & Summarize
+# ----------------------------
+
+def add_files_to_queue(uploaded_files: List) -> None:
+    for uf in uploaded_files:
+        name = uf.name
+        ext = os.path.splitext(name)[1].lower()
+        fid = hashlib.sha1((name + str(time.time())).encode("utf-8")).hexdigest()[:10]
+        entry = {
+            "id": fid,
+            "name": name,
+            "ext": ext,
+            "size": uf.size,
+            "status": "Pending",
+            "bytes": None,
+            "text": None,
+        }
+        if ext == ".pdf":
+            entry["bytes"] = uf.read()
+        elif ext in (".txt", ".md"):
+            entry["text"] = uf.read().decode("utf-8", errors="replace")
+        else:
+            log(f"Skipped unsupported upload: {name}", level="WARN", stage="Ingestion")
+            continue
+        st.session_state.queue.append(entry)
+        log(f"Queued file: {name}", stage="Ingestion")
+
+
+def scan_folder_to_queue(folder_path: str, allowed_exts: Tuple[str, ...] = (".pdf", ".txt", ".md")):
+    # Folder paths only work if accessible inside the container.
+    if not folder_path or not folder_path.strip():
+        st.error("Please provide a folder path.")
+        return
+    folder_path = folder_path.strip()
+    if not os.path.isdir(folder_path):
+        st.error("Folder path not found inside this runtime. On Hugging Face Spaces, use multi-upload instead.")
+        log(f"Folder path not accessible: {folder_path}", level="ERROR", stage="Ingestion")
+        return
+
+    files = []
+    for fn in os.listdir(folder_path):
+        full = os.path.join(folder_path, fn)
+        if not os.path.isfile(full):
+            continue
+        ext = os.path.splitext(fn)[1].lower()
+        if ext in allowed_exts:
+            files.append(full)
+
+    if not files:
+        st.warning("No supported files found in directory.")
+        return
+
+    for full in sorted(files):
+        name = os.path.basename(full)
+        ext = os.path.splitext(name)[1].lower()
+        fid = hashlib.sha1((full + str(time.time())).encode("utf-8")).hexdigest()[:10]
+        entry = {
+            "id": fid,
+            "name": name,
+            "ext": ext,
+            "size": os.path.getsize(full),
+            "status": "Pending",
+            "bytes": None,
+            "text": None,
+            "source_path": full,
+        }
+        if ext == ".pdf":
+            with open(full, "rb") as f:
+                entry["bytes"] = f.read()
+        else:
+            with open(full, "r", encoding="utf-8", errors="replace") as f:
+                entry["text"] = f.read()
+        st.session_state.queue.append(entry)
+        log(f"Queued from folder: {name}", stage="Ingestion")
+
+
+def render_queue_table():
+    if not st.session_state.queue:
+        st.write("Queue is empty.")
+        return
+    df = pd.DataFrame([{
+        "id": q["id"],
+        "name": q["name"],
+        "type": q["ext"],
+        "size_kb": int(q["size"] / 1024),
+        "status": q.get("status", ""),
+    } for q in st.session_state.queue])
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+def run_conversion_and_summary():
+    reset_stop()
+
+    if not st.session_state.queue:
+        st.error("No documents in queue.")
+        return
+
+    # Start new run
+    run_id = new_run_id()
+    st.session_state.run_id = run_id
+    paths = ensure_dirs(run_id)
+
+    set_stage("Scanning")
+    log(f"Run started: {run_id}", stage="Scanning")
+
+    # Write meta snapshot
+    meta = {
+        "run_id": run_id,
+        "created_at": now_iso(),
+        "output_language": st.session_state.output_language,
+        "ui_language": st.session_state.ui_language,
+        "theme": st.session_state.theme,
+        "models": st.session_state.model_by_feature,
+        "model_global": st.session_state.model_global,
+        "queue": [{"name": q["name"], "ext": q["ext"], "size": q["size"], "id": q["id"]} for q in st.session_state.queue],
+    }
+    st.session_state.run_meta = meta
+    write_run_meta(paths, meta)
+
+    # Convert each doc
+    set_stage("Converting")
+    progress = st.progress(0)
+    n = len(st.session_state.queue)
+
+    for i, fe in enumerate(st.session_state.queue):
+        if should_stop():
+            log("Conversion halted by user.", level="WARN", stage="Converting")
+            break
+        fid = fe["id"]
+        try:
+            fe["status"] = "Converting"
+            md, metrics, out_path = convert_document(fe, paths)
+            st.session_state.converted[fid] = md
+            st.session_state.converted_paths[fid] = out_path
+            st.session_state.doc_metrics[fid] = metrics
+            fe["status"] = "Converted"
+            log(f"Converted OK: {fe['name']}", level="SUCCESS", doc_id=fid, stage="Converting")
+        except Exception as e:
+            fe["status"] = "Failed"
+            log(f"Convert failed: {fe['name']} — {e}", level="ERROR", doc_id=fid, stage="Converting")
+        progress.progress(int(((i + 1) / n) * 100))
+
+    # Save logs so far
+    write_logs(paths)
+
+    # Summarize
+    if should_stop():
+        set_stage("Interrupted")
+        write_logs(paths)
+        st.warning("Run interrupted. Partial outputs are available for export.")
+        return
+
+    converted_ok = {fid: md for fid, md in st.session_state.converted.items()}
+    if not converted_ok:
+        st.error("No documents converted successfully; cannot summarize.")
+        return
+
+    set_stage("Summarizing")
+    log("Building sources block for summarization", stage="Summarizing")
+    sources_block = build_sources_block(st.session_state.converted, st.session_state.queue)
+
+    system_p = st.session_state.prompt_templates["summary_system"]
+    user_p = st.session_state.prompt_templates["summary_user"].format(
+        output_language=st.session_state.output_language,
+        sources_block=sources_block,
+    ).replace("{run_id}", run_id)  # in case template includes run_id literal
+
+    model = st.session_state.model_by_feature.get("summary", st.session_state.model_global)
+    st.subheader("Integrated Summary (streaming)")
+    log(f"Calling LLM for summary (model={model})", stage="Summarizing")
+    try:
+        result = run_llm(system_p, user_p, model=model, stream_to_ui=True)
+        summary_md = result.text.strip()
+        summary_md = ensure_summary_length(summary_md, st.session_state.output_language, model=model, max_rounds=2)
+        sum_path = save_summary(paths, summary_md)
+        log(f"Summary saved → {sum_path}", level="SUCCESS", stage="Summarizing")
+        add_summary_version("Integrated Summary (v1)", summary_md, {"model": model, "provider": result.provider, "run_id": run_id})
+    except Exception as e:
+        log(f"Summary generation failed: {e}", level="ERROR", stage="Summarizing")
+        st.error(f"Summary generation failed: {e}")
+        write_logs(paths)
+        return
+
+    write_run_meta(paths, st.session_state.run_meta)
+    write_logs(paths)
+
+    set_stage("Completed")
+    log("Run completed successfully.", level="SUCCESS", stage="Completed")
+    st.success("Completed: per-document Markdown created + integrated summary generated.")
+
+
+# ----------------------------
+# Summary Interaction UI
+# ----------------------------
+
+def render_summary_panel():
+    st.subheader("Summary Version Vault")
+    versions = st.session_state.summary_versions
+    if not versions:
+        st.write("No summary yet.")
+        return
+
+    options = [f"{v['created_at']} — {v['name']} ({v['id']})" for v in versions]
+    selected = st.selectbox("Select active summary version", options, index=len(options) - 1)
+    sid = selected.split("(")[-1].split(")")[0]
+    st.session_state.active_summary_id = sid
+
+    active = get_active_summary_text()
+    st.markdown(active)
+
+    # Download active summary
+    st.download_button(
+        "Download Active Summary.md",
+        data=active.encode("utf-8"),
+        file_name="summary.md",
+        mime="text/markdown",
+    )
+
+    # Chat / follow-up prompt
+    st.divider()
+    st.subheader("Keep Prompting on Summary")
+    user_prompt = st.text_area("Prompt", "", height=100, placeholder="Ask for refinement, expansions, or targeted extraction...")
+    if st.button("Run Summary Chat"):
+        if not user_prompt.strip():
+            st.error("Please enter a prompt.")
+        else:
+            set_stage("Chat")
+            log("Running summary chat", stage="Chat")
+            model = st.session_state.model_by_feature.get("summary_chat", st.session_state.model_global)
+            system_p = "You answer using the summary as context."
+            user_p = st.session_state.prompt_templates["summary_chat"].format(
+                output_language=st.session_state.output_language,
+                summary=active,
+                user_prompt=user_prompt,
+            )
+            st.subheader("Chat Response (streaming)")
+            result = run_llm(system_p, user_p, model=model, stream_to_ui=True)
+            out = result.text.strip()
+            add_summary_version("Chat refinement", out, {"model": model, "provider": result.provider})
+            log("Summary chat completed", level="SUCCESS", stage="Chat")
+
+    # WOW Magics
+    st.divider()
+    st.subheader("WOW Summary Magics (6)")
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        magic = st.selectbox("Choose a magic", WOW_SUMMARY_MAGICS)
+    with c2:
+        style = st.session_state.painter_style
 
     if st.button("Apply Magic"):
-        agent_id = magic_options[magic_name]
-        base_prompt = st.session_state["agents_cfg"]["agents"][agent_id]["system_prompt"]
-        if magic_name == "AI Keywords":
-            magic_prompt_suffix = f"""
-When returning keywords, identify the most important regulatory and technical
-keywords. Wrap each keyword in an HTML span with inline style using this color:
-{keyword_color}.
-
-Example:
-- <span style="color:{keyword_color};font-weight:bold;">predicate device</span>
-"""
-        else:
-            magic_prompt_suffix = ""
-
-        full_prompt = base_prompt + "\n\n" + magic_prompt_suffix
-
-        agent_run_ui(
-            agent_id=agent_id,
-            tab_key=f"magic_{agent_id}",
-            default_prompt=full_prompt,
-            default_input_text=processed,
-            tab_label_for_history=f"Magic-{magic_name}",
-        )
+        run_summary_magic(magic, style)
 
 
-# =========================
-# New Tab: FDA Reviewer Orchestration
-# =========================
+# ----------------------------
+# Agents YAML Manager UI
+# ----------------------------
 
-def render_fda_orchestration_tab():
-    st.title("FDA Reviewer Orchestration")
+def render_agents_yaml_manager():
+    st.subheader("agents.yaml Manager")
+    st.write("Upload / standardize / edit / download agents.yaml. Non-standard YAML can be transformed.")
 
-    # ---------- Step 1: Device Description Ingestion ----------
-    st.subheader("Step 1 – Provide Device Description (text / markdown / JSON or file upload)")
+    up = st.file_uploader("Upload agents.yaml", type=["yaml", "yml"])
+    if up is not None:
+        txt = up.read().decode("utf-8", errors="replace")
+        st.session_state.agents_yaml_text = txt
+        log("agents.yaml uploaded.", stage="agents.yaml")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        device_raw_text = st.text_area(
-            "Paste device description (device name, classification, description, intended use, etc.)",
-            height=260,
-            key="orch_device_raw",
-        )
-    with col2:
-        file = st.file_uploader("Or upload device file (PDF / DOCX / TXT)", type=["pdf", "docx", "txt"])
-        if file is not None:
-            if file.type == "application/pdf":
-                extracted = extract_pdf_pages_to_text(file, 1, 9999)
-            elif file.type in ["application/vnd.openxmlformats-officedocument.wordprocessingml.document"]:
-                extracted = extract_docx_to_text(file)
-            else:  # txt
-                extracted = file.read().decode("utf-8", errors="ignore")
-            if st.button("Use uploaded file as device description"):
-                st.session_state["orch_device_raw"] = extracted
-                device_raw_text = extracted
-                st.success("Loaded device description from file.")
-
-    # ---------- Step 1b: Transform to organized markdown with coral keywords ----------
-    st.markdown("#### Step 1b – Transform into organized markdown with highlighted keywords")
-    if "orch_device_struct_status" not in st.session_state:
-        st.session_state["orch_device_struct_status"] = "pending"
-    show_status("Device Description Structuring", st.session_state["orch_device_struct_status"])
-
-    colm1, colm2 = st.columns([2, 1])
-    with colm1:
-        struct_model = st.selectbox(
-            "Model for structuring",
-            ALL_MODELS,
-            index=ALL_MODELS.index(st.session_state.settings["model"]),
-            key="orch_device_model",
-        )
-    with colm2:
-        struct_max_tokens = st.number_input(
-            "max_tokens",
-            min_value=1000,
-            max_value=120000,
-            value=st.session_state.settings["max_tokens"],
-            step=1000,
-            key="orch_device_max_tokens",
-        )
-
-    if st.button("Transform to structured markdown", key="orch_device_run"):
-        if not device_raw_text.strip():
-            st.warning("Please provide device text or upload a file first.")
-        else:
-            st.session_state["orch_device_struct_status"] = "running"
-            show_status("Device Description Structuring", "running")
-            api_keys = st.session_state.get("api_keys", {})
-            system_prompt = """
-You are a medical device documentation organizer.
-
-Input: unstructured device description text (may include device name, classification,
-regulation number, product code, intended use, technological characteristics,
-key materials, key risks, and any other relevant info).
-
-Task:
-1. Produce a CLEAN, well-structured markdown device description with sections like:
-   - Device Name
-   - Classification & Regulation
-   - Product Code (if any)
-   - Intended Use / Indications for Use
-   - Device Description
-   - Technological Characteristics
-   - Key Performance Claims
-   - Key Risks and Risk Controls (if mentioned)
-2. Within the markdown, highlight important regulatory and technical keywords
-   using coral color:
-   Wrap each important keyword or short phrase with:
-   <span style="color:coral;font-weight:600;">keyword</span>
-3. Do NOT invent content. Only structure what is present. You may group information
-   and make headings but do not hallucinate new facts.
-"""
-            user_prompt = device_raw_text
-
-            with st.spinner("Transforming device description..."):
-                try:
-                    out = call_llm(
-                        model=struct_model,
-                        system_prompt=system_prompt,
-                        user_prompt=user_prompt,
-                        max_tokens=struct_max_tokens,
-                        temperature=0.15,
-                        api_keys=api_keys,
-                    )
-                    st.session_state["orch_device_md"] = out
-                    st.session_state["orch_device_struct_status"] = "done"
-                    token_est = int(len(user_prompt + out) / 4)
-                    log_event(
-                        "FDA Orchestration",
-                        "Device Description Structurer",
-                        struct_model,
-                        token_est,
-                    )
-                except Exception as e:
-                    st.session_state["orch_device_struct_status"] = "error"
-                    st.error(f"Error structuring device description: {e}")
-
-    st.markdown("##### Structured Device Description (editable)")
-    device_md = st.session_state.get("orch_device_md", device_raw_text)
-    view_mode = st.radio(
-        "View mode", ["Markdown", "Plain text"],
-        horizontal=True, key="orch_device_viewmode"
-    )
-    if view_mode == "Markdown":
-        device_md_edited = st.text_area(
-            "Device description (Markdown)",
-            value=device_md,
-            height=260,
-            key="orch_device_md_edited",
-        )
-    else:
-        device_md_edited = st.text_area(
-            "Device description (Plain text)",
-            value=device_md,
-            height=260,
-            key="orch_device_txt_edited",
-        )
-    st.session_state["orch_device_md_effective"] = device_md_edited
-
-    # ---------- Step 2: Agents Catalog (default or uploaded) ----------
-    st.markdown("---")
-    st.subheader("Step 2 – Select agents.yaml (default or uploaded)")
-
-    agents_cfg = st.session_state["agents_cfg"]
-    with st.expander("Current agents catalog overview"):
-        agents_df = pd.DataFrame([
-            {
-                "agent_id": aid,
-                "name": acfg.get("name", ""),
-                "category": acfg.get("category", ""),
-            }
-            for aid, acfg in agents_cfg.get("agents", {}).items()
-        ])
-        st.dataframe(agents_df, use_container_width=True, height=240)
-
-    # ---------- Step 3: Build Orchestration Prompt and Run ----------
-    st.markdown("---")
-    st.subheader("Step 3 – Generate FDA 510(k) Review Orchestration Plan")
-
-    colx1, colx2, colx3 = st.columns(3)
-    with colx1:
-        submission_type = st.text_input("Submission Type (e.g., Traditional 510(k))", "")
-    with colx2:
-        regulatory_pathway = st.text_input("Regulatory Pathway", "510(k)")
-    with colx3:
-        clinical_data_status = st.selectbox(
-            "Clinical Data Available?",
-            ["Unclear", "Yes", "No"],
-            index=0,
-        )
-
-    known_predicates = st.text_input("Known predicate devices (free text)", "")
-    special_circumstances = st.text_area("Special circumstances (pediatric, home use, AI/ML, etc.)", height=80)
-
-    depth_choice = st.radio(
-        "Requested analysis depth",
-        ["Quick Assessment", "Standard Orchestration", "Comprehensive Planning"],
-        index=1,
-        horizontal=True,
-    )
-    depth_quick = "☑ Quick Assessment (identify primary agents only)" if depth_choice == "Quick Assessment" \
-        else "☐ Quick Assessment (identify primary agents only)"
-    depth_standard = "☑ Standard Orchestration (full phase-based plan)" if depth_choice == "Standard Orchestration" \
-        else "☐ Standard Orchestration (full phase-based plan)"
-    depth_comprehensive = "☑ Comprehensive Planning (include timeline, challenges, execution commands)" \
-        if depth_choice == "Comprehensive Planning" \
-        else "☐ Comprehensive Planning (include timeline, challenges, execution commands)"
-
-    base_user_prompt = FDA_ORCH_USER_TEMPLATE.format(
-        device_information=device_md_edited or "[Device description not provided]",
-        submission_type=submission_type or "[Not provided]",
-        regulatory_pathway=regulatory_pathway or "[Not provided]",
-        known_predicates=known_predicates or "[Not provided]",
-        clinical_data_status=clinical_data_status,
-        special_circumstances=special_circumstances or "[None noted]",
-        depth_quick=depth_quick,
-        depth_standard=depth_standard,
-        depth_comprehensive=depth_comprehensive,
-    )
-
-    st.markdown("##### Orchestration Prompt (editable before running)")
-    orch_prompt_text = st.text_area(
-        "Orchestration prompt",
-        value=st.session_state.get("orch_prompt_text", base_user_prompt),
+    st.session_state.agents_yaml_text = st.text_area(
+        "agents.yaml (editable)",
+        st.session_state.agents_yaml_text,
         height=260,
-        key="orch_prompt_text",
     )
 
-    colp1, colp2, colp3 = st.columns([2, 1, 1])
-    with colp1:
-        orch_model = st.selectbox(
-            "Model for orchestration",
-            ALL_MODELS,
-            index=ALL_MODELS.index(st.session_state.settings["model"]),
-            key="orch_model",
-        )
-    with colp2:
-        orch_max_tokens = st.number_input(
-            "max_tokens",
-            min_value=8000,
-            max_value=120000,
-            value=max(20000, st.session_state.settings["max_tokens"]),
-            step=2000,
-            key="orch_max_tokens",
-        )
-    with colp3:
-        if "orch_status" not in st.session_state:
-            st.session_state["orch_status"] = "pending"
-        show_status("FDA Review Orchestrator", st.session_state["orch_status"])
-
-    if st.button("Run Orchestrator", key="orch_run"):
-        st.session_state["orch_status"] = "running"
-        show_status("FDA Review Orchestrator", "running")
-        api_keys = st.session_state.get("api_keys", {})
-
-        # Provide the active agents.yaml catalog as context so the model knows which agents exist
-        agents_yaml_str = yaml.dump(agents_cfg.get("agents", {}), allow_unicode=True, sort_keys=False)
-        user_prompt_full = orch_prompt_text + "\n\n---\n\nAGENT CATALOG (agents.yaml excerpt):\n\n" + agents_yaml_str
-
-        with st.spinner("Creating orchestration plan..."):
-            try:
-                out = call_llm(
-                    model=orch_model,
-                    system_prompt=FDA_ORCH_SYSTEM_PROMPT,
-                    user_prompt=user_prompt_full,
-                    max_tokens=orch_max_tokens,
-                    temperature=0.2,
-                    api_keys=api_keys,
-                )
-                st.session_state["orch_plan"] = out
-                st.session_state["orch_status"] = "done"
-                token_est = int(len(user_prompt_full + out) / 4)
-                log_event(
-                    "FDA Orchestration",
-                    "FDA Review Orchestrator",
-                    orch_model,
-                    token_est,
-                )
-            except Exception as e:
-                st.session_state["orch_status"] = "error"
-                st.error(f"Error running orchestrator: {e}")
-
-    st.markdown("##### Orchestration Plan (Markdown / text, editable)")
-    orch_plan = st.session_state.get("orch_plan", "")
-    view_mode2 = st.radio(
-        "Plan view mode", ["Markdown", "Plain text"],
-        horizontal=True, key="orch_plan_viewmode"
-    )
-    if view_mode2 == "Markdown":
-        orch_plan_edited = st.text_area(
-            "Orchestration Plan (Markdown)",
-            value=orch_plan,
-            height=360,
-            key="orch_plan_md_edited",
-        )
-    else:
-        orch_plan_edited = st.text_area(
-            "Orchestration Plan (Plain text)",
-            value=orch_plan,
-            height=360,
-            key="orch_plan_txt_edited",
-        )
-    st.session_state["orch_plan_effective"] = orch_plan_edited
-
-    # ---------- Step 4: Execute agents one by one, chaining outputs ----------
-    st.markdown("---")
-    st.subheader("Step 4 – Execute Review Agents (chain outputs between agents)")
-
-    agents_cfg = st.session_state["agents_cfg"]
-    agent_ids = list(agents_cfg["agents"].keys())
-    selected_agents = st.multiselect(
-        "Select agents to run sequentially",
-        agent_ids,
-        help="You can run agents one by one using the orchestration plan or device description as input.",
-    )
-
-    base_chain_input = st.session_state.get("orch_plan_effective", "") or st.session_state.get(
-        "orch_device_md_effective", ""
-    )
-    current_text = base_chain_input
-
-    if not base_chain_input:
-        st.info("Once you have an orchestration plan or structured device description, you can use it as the starting input here.")
-
-    for aid in selected_agents:
-        st.markdown(f"#### Agent: {agents_cfg['agents'][aid].get('name', aid)}")
-        agent_run_ui(
-            agent_id=aid,
-            tab_key=f"orch_exec_{aid}",
-            default_prompt=agents_cfg["agents"][aid].get("user_prompt_template", agents_cfg["agents"][aid].get("system_prompt", "")),
-            default_input_text=current_text,
-            tab_label_for_history=f"Orchestration-{aid}",
-        )
-        current_text = st.session_state.get(f"orch_exec_{aid}_output_edited", current_text)
-
-
-# =========================
-# New Tab: Dynamic Review Agent Generator from FDA Guidance
-# =========================
-
-def render_dynamic_agents_tab():
-    st.title("Dynamic Review Agent Generator from FDA Guidance")
-
-    # Step 1: Guidance ingestion
-    st.subheader("Step 1 – Provide FDA Guidance Text")
-    gfile = st.file_uploader("Upload guidance (PDF / MD / TXT)", type=["pdf", "md", "txt"], key="dyn_guidance_file")
-    guidance_text = ""
-    if gfile is not None:
-        if gfile.type == "application/pdf":
-            guidance_text = extract_pdf_pages_to_text(gfile, 1, 9999)
-        else:
-            guidance_text = gfile.read().decode("utf-8", errors="ignore")
-
-    guidance_text_manual = st.text_area("Or paste guidance text/markdown here", height=220, key="dyn_guidance_manual")
-    guidance_text = guidance_text or guidance_text_manual
-
-    if not guidance_text.strip():
-        st.info("Provide FDA guidance text to enable checklist and dynamic agent generation.")
-        return
-
-    # Optional: Generate checklist using existing guidance_to_checklist_converter agent
-    st.markdown("---")
-    st.subheader("Step 2 – (Optional) Generate Review Checklist from Guidance")
-
-    if "guidance_to_checklist_converter" in st.session_state["agents_cfg"]["agents"]:
-        default_prompt = st.session_state["agents_cfg"]["agents"]["guidance_to_checklist_converter"].get(
-            "user_prompt_template",
-            f"Please generate a detailed review checklist from the following guidance:\n\n{guidance_text}\n",
-        )
-        agent_run_ui(
-            agent_id="guidance_to_checklist_converter",
-            tab_key="dyn_checklist",
-            default_prompt=default_prompt,
-            default_input_text=guidance_text,
-            tab_label_for_history="Dynamic-Checklist",
-        )
-    else:
-        st.warning("Agent 'guidance_to_checklist_converter' not found in agents.yaml; skipping checklist step.")
-
-    checklist_md = st.session_state.get("dyn_checklist_output_edited", "")
-
-    # Step 3: Dynamic Agent Generator
-    st.markdown("---")
-    st.subheader("Step 3 – Generate New Specialized Agents from Guidance")
-
-    if "dyn_agent_status" not in st.session_state:
-        st.session_state["dyn_agent_status"] = "pending"
-    show_status("Dynamic Agent Generator", st.session_state["dyn_agent_status"])
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        dyn_model = st.selectbox(
-            "Model for dynamic agents",
-            ALL_MODELS,
-            index=ALL_MODELS.index(st.session_state.settings["model"]),
-            key="dyn_agent_model",
-        )
-    with col2:
-        dyn_max_tokens = st.number_input(
-            "max_tokens",
-            min_value=8000,
-            max_value=120000,
-            value=max(20000, st.session_state.settings["max_tokens"]),
-            step=2000,
-            key="dyn_agent_max_tokens",
-        )
-    with col3:
-        num_agents_hint = st.slider(
-            "Target number of new agents (hint to model)",
-            min_value=3,
-            max_value=8,
-            value=5,
-            step=1,
-            key="dyn_agent_count",
-        )
-
-    # Build user prompt: include guidance, checklist, and current agents.yaml catalog
-    current_agents_yaml = yaml.dump(
-        st.session_state["agents_cfg"].get("agents", {}),
-        allow_unicode=True,
-        sort_keys=False,
-    )
-    dyn_user_prompt = f"""
-You are given the following FDA guidance text:
-
-=== FDA GUIDANCE TEXT ===
-{guidance_text}
-
-=== OPTIONAL CHECKLIST (if present) ===
-{checklist_md if checklist_md else "[No checklist provided]"} 
-
-=== EXISTING AGENTS CATALOG (agents.yaml excerpt) ===
-{current_agents_yaml}
-
-Your task: create approximately {num_agents_hint} NEW specialized review agents
-(to be added to agents.yaml) that are carefully tailored to this guidance, without
-duplicating existing agents.
-"""
-
-    if st.button("Generate New Agents.yaml Snippet", key="dyn_agent_run"):
-        st.session_state["dyn_agent_status"] = "running"
-        show_status("Dynamic Agent Generator", "running")
-        api_keys = st.session_state.get("api_keys", {})
-
-        with st.spinner("Generating new agent definitions from guidance..."):
-            try:
-                out = call_llm(
-                    model=dyn_model,
-                    system_prompt=DYNAMIC_AGENT_SYSTEM_PROMPT,
-                    user_prompt=dyn_user_prompt,
-                    max_tokens=dyn_max_tokens,
-                    temperature=0.2,
-                    api_keys=api_keys,
-                )
-                st.session_state["dyn_agent_yaml"] = out
-                st.session_state["dyn_agent_status"] = "done"
-                token_est = int(len(dyn_user_prompt + out) / 4)
-                log_event(
-                    "Dynamic Agents",
-                    "Dynamic Agent Generator",
-                    dyn_model,
-                    token_est,
-                )
-            except Exception as e:
-                st.session_state["dyn_agent_status"] = "error"
-                st.error(f"Error generating dynamic agents: {e}")
-
-    st.markdown("##### Generated agents.yaml snippet (editable)")
-    dyn_yaml = st.session_state.get("dyn_agent_yaml", "")
-    dyn_yaml_edited = st.text_area(
-        "agents.yaml snippet",
-        value=dyn_yaml,
-        height=360,
-        key="dyn_agent_yaml_edited",
-    )
-
-    if dyn_yaml_edited.strip():
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("Deterministic Standardize"):
+            std, rep = deterministic_standardize_agents_yaml(st.session_state.agents_yaml_text)
+            st.session_state.agents_yaml_text = std
+            st.session_state.agents_yaml_standard_report = rep
+            log("Deterministic standardization completed.", stage="agents.yaml")
+    with c2:
+        if st.button("LLM Standardize"):
+            std, rep = llm_standardize_agents_yaml(st.session_state.agents_yaml_text)
+            st.session_state.agents_yaml_text = std
+            st.session_state.agents_yaml_standard_report = rep
+            log("LLM standardization completed.", stage="agents.yaml")
+    with c3:
         st.download_button(
-            "Download agents.yaml snippet",
-            data=dyn_yaml_edited.encode("utf-8"),
-            file_name="dynamic_agents.yaml",
+            "Download agents.yaml",
+            data=(st.session_state.agents_yaml_text or "").encode("utf-8"),
+            file_name="agents.yaml",
             mime="text/yaml",
         )
-        st.info("You can merge this YAML into your main agents.yaml and reload the app (or upload via sidebar).")
+
+    if st.session_state.agents_yaml_standard_report:
+        st.info(st.session_state.agents_yaml_standard_report)
 
 
-# =========================
-# Main app
-# =========================
+# ----------------------------
+# AI Note Keeper UI
+# ----------------------------
 
-st.set_page_config(page_title="FDA 510(k) Agentic Reviewer", layout="wide")
+def render_note_keeper():
+    st.subheader("AI Note Keeper")
+    note_input = st.text_area("Paste text/markdown", "", height=200, placeholder="Paste your note here...")
 
-# Initialize session state
-if "settings" not in st.session_state:
-    st.session_state["settings"] = {
-        "theme": "Light",
-        "language": "English",
-        "painter_style": "Van Gogh",
-        "model": "gpt-4o-mini",
-        "max_tokens": 12000,
-        "temperature": 0.2,
-    }
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Organize into Markdown"):
+            run_note_organize(note_input)
+    with c2:
+        st.caption("Output language follows the global Output Language selector.")
 
-if "history" not in st.session_state:
-    st.session_state["history"] = []
+    st.divider()
+    st.subheader("Note Magics (6)")
+    magic = st.selectbox("Choose a note magic", NOTE_MAGICS)
+    keywords = ""
+    color = "yellow"
+    if magic == "AI Keywords Highlighter":
+        keywords = st.text_input("Keywords (comma-separated)", "")
+        color = st.selectbox("Highlight color", ["yellow", "pink", "cyan", "lime", "orange"], index=0)
 
-# Load default agents.yaml once (can be overridden in sidebar)
-if "agents_cfg" not in st.session_state:
-    try:
-        with open("agents.yaml", "r", encoding="utf-8") as f:
-            st.session_state["agents_cfg"] = yaml.safe_load(f)
-    except Exception as e:
-        st.error(f"Failed to load agents.yaml: {e}")
-        st.stop()
+    if st.button("Apply Note Magic"):
+        # Prefer latest note version if exists; else use pasted input
+        base_note = st.session_state.note_versions[-1]["text"] if st.session_state.note_versions else note_input
+        run_note_magic(base_note, magic, keywords=keywords, color=color)
 
-# Render sidebar (WOW UI + API keys + optional agents.yaml override)
-render_sidebar()
+    st.divider()
+    st.subheader("Note Versions")
+    if not st.session_state.note_versions:
+        st.write("No note outputs yet.")
+    else:
+        opts = [f"{v['created_at']} — {v['name']} ({v['id']})" for v in st.session_state.note_versions]
+        sel = st.selectbox("Select note version", opts, index=len(opts) - 1)
+        nid = sel.split("(")[-1].split(")")[0]
+        nv = next(v for v in st.session_state.note_versions if v["id"] == nid)
+        st.markdown(nv["text"])
+        st.download_button("Download Note.md", nv["text"].encode("utf-8"), file_name="note.md", mime="text/markdown")
 
-# Apply WOW painter style & theme CSS
-apply_style(st.session_state.settings["theme"], st.session_state.settings["painter_style"])
 
-# Tabs with localized labels (original tabs + new FDA Orchestration + Dynamic Agents)
-lang = st.session_state.settings["language"]
-tab_labels = [
-    t("Dashboard"),
-    t("510k_tab"),
-    t("PDF → Markdown"),
-    t("Summary & Entities"),
-    t("Comparator"),
-    t("Checklist & Report"),
-    t("Note Keeper & Magics"),
-    t("FDA Orchestration"),
-    t("Dynamic Agents"),
-]
-tabs = st.tabs(tab_labels)
+# ----------------------------
+# Dashboard UI
+# ----------------------------
 
-with tabs[0]:
-    render_dashboard()
-with tabs[1]:
-    render_510k_tab()
-with tabs[2]:
-    render_pdf_to_md_tab()
-with tabs[3]:
-    render_summary_tab()
-with tabs[4]:
-    render_diff_tab()
-with tabs[5]:
-    render_checklist_tab()
-with tabs[6]:
-    render_note_keeper_tab()
-with tabs[7]:
-    render_fda_orchestration_tab()
-with tabs[8]:
-    render_dynamic_agents_tab()
+def render_dashboard():
+    st.subheader("WOW Dashboard & Visualizations")
+
+    # Quick metrics
+    q = st.session_state.queue
+    converted_count = sum(1 for x in q if x.get("status") == "Converted")
+    failed_count = sum(1 for x in q if x.get("status") == "Failed")
+    st.write(f"Queue: {len(q)} | Converted: {converted_count} | Failed: {failed_count}")
+
+    # Visualization selector
+    viz = st.selectbox("Visualization", VISUALIZATION_OPTIONS)
+    if viz == "Run Timeline (Gantt-like)":
+        viz_run_timeline()
+    elif viz == "Source Contribution Heatmap (Heuristic)":
+        viz_source_contribution_heatmap()
+    elif viz == "Topic Map (Top Terms)":
+        viz_topic_map()
+    elif viz == "Entity Network (Heuristic Co-occurrence)":
+        viz_entity_network()
+    elif viz == "Risk & Uncertainty Radar (Heuristic)":
+        viz_risk_radar()
+    elif viz == "Version Diff Viewer (Text)":
+        viz_version_diff()
+
+    st.divider()
+    st.subheader("Per-Document Metrics")
+    if st.session_state.doc_metrics:
+        df = pd.DataFrame([
+            {"doc_id": fid, **m} for fid, m in st.session_state.doc_metrics.items()
+        ])
+        st.dataframe(df, use_container_width=True, hide_index=True)
+    else:
+        st.write("No metrics yet.")
+
+    st.divider()
+    st.subheader("Export Packager (ZIP)")
+    artifacts_dir = st.session_state.last_run_artifacts_dir
+    if artifacts_dir and os.path.isdir(artifacts_dir):
+        if st.button("Build Export ZIP"):
+            zbytes = build_export_zip(artifacts_dir)
+            st.download_button(
+                "Download Export Bundle.zip",
+                data=zbytes,
+                file_name=f"{st.session_state.run_id or 'run'}_bundle.zip",
+                mime="application/zip",
+            )
+    else:
+        st.write("No run artifacts directory found yet.")
+
+
+# ----------------------------
+# Main App
+# ----------------------------
+
+def main():
+    _init_state()
+    render_header()
+    render_sidebar_settings()
+
+    tabs = st.tabs([
+        "Convert & Summarize",
+        "Queue & Outputs",
+        "WOW Studio",
+        "AI Note Keeper",
+        "agents.yaml Manager",
+        "Dashboard",
+        "Logs",
+    ])
+
+    # --- Convert & Summarize ---
+    with tabs[0]:
+        st.subheader("Input Documents")
+
+        mode = st.radio("Ingestion mode", ["Multi-upload (recommended on Spaces)", "Folder path (server-side)"], index=0)
+        if mode.startswith("Multi-upload"):
+            uploaded = st.file_uploader(
+                "Upload multiple documents (txt, md, pdf)",
+                type=["txt", "md", "pdf"],
+                accept_multiple_files=True,
+            )
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                if st.button("Add uploaded files to queue"):
+                    if uploaded:
+                        add_files_to_queue(uploaded)
+                    else:
+                        st.error("No files uploaded.")
+            with c2:
+                if st.button("Clear queue"):
+                    st.session_state.queue = []
+                    st.session_state.converted = {}
+                    st.session_state.converted_paths = {}
+                    st.session_state.doc_metrics = {}
+                    log("Queue cleared by user.", stage="Ingestion")
+        else:
+            folder = st.text_input("Folder path (must exist inside this runtime)", value="")
+            if st.button("Scan folder and add to queue"):
+                scan_folder_to_queue(folder)
+
+        st.divider()
+        st.subheader("Queue")
+        render_queue_table()
+
+        st.divider()
+        st.subheader("Execute")
+        st.write("This will: (1) convert each document to Markdown, (2) generate an integrated 3000–4000-word summary.")
+        if st.button("Run Conversion + Integrated Summary"):
+            run_conversion_and_summary()
+
+        st.divider()
+        render_summary_panel()
+
+    # --- Queue & Outputs ---
+    with tabs[1]:
+        st.subheader("Queue Management & Outputs")
+        render_queue_table()
+
+        st.divider()
+        st.subheader("Converted Markdown Outputs")
+        if st.session_state.converted:
+            for fe in st.session_state.queue:
+                fid = fe["id"]
+                if fid not in st.session_state.converted:
+                    continue
+                with st.expander(f"{fe['name']} → Markdown", expanded=False):
+                    st.caption(f"Saved path: {st.session_state.converted_paths.get(fid, '(memory only)')}")
+                    st.markdown(st.session_state.converted[fid])
+                    st.download_button(
+                        f"Download {slugify(os.path.splitext(fe['name'])[0])}.md",
+                        data=st.session_state.converted[fid].encode("utf-8"),
+                        file_name=f"{slugify(os.path.splitext(fe['name'])[0])}.md",
+                        mime="text/markdown",
+                        key=f"dl_{fid}",
+                    )
+        else:
+            st.write("No converted outputs yet.")
+
+        st.divider()
+        st.subheader("Summary Versions")
+        if st.session_state.summary_versions:
+            st.write(f"{len(st.session_state.summary_versions)} summary version(s) available.")
+        else:
+            st.write("No summary yet.")
+
+    # --- WOW Studio ---
+    with tabs[2]:
+        render_prompt_editor()
+
+    # --- AI Note Keeper ---
+    with tabs[3]:
+        render_note_keeper()
+
+    # --- agents.yaml Manager ---
+    with tabs[4]:
+        render_agents_yaml_manager()
+
+    # --- Dashboard ---
+    with tabs[5]:
+        render_dashboard()
+
+    # --- Logs ---
+    with tabs[6]:
+        render_logs()
+
+
+if __name__ == "__main__":
+    main()
