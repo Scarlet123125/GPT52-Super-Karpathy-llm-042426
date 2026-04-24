@@ -10,3 +10,5 @@ PyYAML
 altair
 httpx
 python-docx
+python-dateutil
+PyMuPDF
