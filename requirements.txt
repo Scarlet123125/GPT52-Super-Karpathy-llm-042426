@@ -12,3 +12,4 @@ httpx
 python-docx
 python-dateutil
 PyMuPDF
+google-genai
